@@ -11,7 +11,7 @@ $output = Join-Path $repo 'bin\tests\fullscreen-resolution'
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 $viewer = Get-Content (Join-Path $repo 'src/backend_win/vm_display_idd.c') -Raw
 $functions = foreach ($name in @('idd_display_settings_load', 'idd_resize_available', 'idd_update_windowed_resolution', 'idd_update_fullscreen_resolution', 'idd_update_display_size', 'idd_select_fullscreen_resolution', 'idd_fit_fullscreen', 'idd_set_fullscreen', 'compute_letterbox', 'window_to_vm_coords')) {
-    $match = [regex]::Match($viewer, "(?ms)^static (?:void|BOOL) $name\(.*?^}")
+    $match = [regex]::Match($viewer, "(?ms)^static (?:void|BOOL) $name\([^;{]*?\)\s*\{.*?^}")
     if (!$match.Success) { throw "Viewer function $name not found; update harness extraction." }
     $match.Value
 }
@@ -24,7 +24,7 @@ $checks = @(
     'case WM_DEVICECHANGE:[\s\S]*?wp == DBT_DEVNODES_CHANGED[\s\S]*?idd_fit_fullscreen\(d,MonitorFromWindow',
     'if \(!d->input_sizing && d->fullscreen && _wcsicmp\(d->os_type,L"windows"\) == 0\)\s*idd_fit_fullscreen',
     'if \(d->fullscreen\) idd_update_fullscreen_resolution\(d\);\s*else idd_update_windowed_resolution\(d\);',
-    'compute_letterbox\(\(UINT\)rc.right, \(UINT\)rc.bottom, d->frame_width, d->frame_height',
+    'compute_letterbox\(\(UINT\)rc.right, \(UINT\)rc.bottom,\s*d->frame_width, d->frame_height',
     'compute_letterbox\(\(UINT\)rc.right, \(UINT\)rc.bottom, vm_w, vm_h'
 )
 foreach ($pattern in $checks) {

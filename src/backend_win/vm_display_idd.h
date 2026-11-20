@@ -18,6 +18,9 @@ BOOL vm_display_idd_is_open(VmDisplayIdd *display);
 UINT_PTR vm_display_idd_token(VmDisplayIdd *display);
 BOOL vm_display_idd_is_fullscreen(VmDisplayIdd *display);
 BOOL vm_display_idd_set_fullscreen(VmDisplayIdd *display, BOOL enabled);
+/* Optional manual-reset cancellation event. Returns the actual completed outcome;
+   cancellation before commit prevents entry, including requests not yet dispatched. */
+BOOL vm_display_idd_set_fullscreen_cancellable(VmDisplayIdd *display, BOOL enabled, HANDLE cancel);
 
 /* Bring an already-open display window to the foreground/focus.
    Safe to call from any thread; the work is marshaled to the window thread. */

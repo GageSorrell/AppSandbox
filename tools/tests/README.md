@@ -1,4 +1,114 @@
+# Integrated display validation (gfa.9)
+
+Run from the repository root:
+
+```powershell
+.\tools\tests\test-display-feature.ps1
+# Explicit staging location, if using the prepared SDK/WDK instead of an installed WDK:
+.\tools\tests\test-display-feature.ps1 -WdkRoot C:\AppSandbox\bin\wdk
+```
+
+Requires VS x64 build tools, Node, the test-only jsdom/Playwright packages described
+below, installed Edge (or `ASB_TEST_BROWSER`), and either an installed WDK or the
+previously staged SDK/WDK tree. No dependency download or install is performed.
+The runner selects `bin/wdk` when that staged tree exists. It discovers Visual
+Studio with vswhere; `-VisualStudioPath` can select another installation.
+App/core checks rebuild Release x64 with `PlatformToolset=v145`, matching the
+installed VS 2026 toolset; the repository's normal project toolset is unchanged.
+
+The runner records each command, result, duration and log in
+`build/display-validation/results.json`, continues after individual failures, and
+fails overall if any check fails. Its checks are:
+
+| Check | Evidence |
+| --- | --- |
+| Registration | All app/core/VDD C/C++ source/header paths exist and are unique; app/filter lists agree; required display sources, transport headers, shared JS assets and option IDs are registered. |
+| Focused native suites | Legacy/default/atomic/concurrent settings, strict editor commands, real monitor union/ranking serializer, CPU/GPU resize protocol and actual VDD handler, windowed/fullscreen policy, overlay geometry and reminder completion/cancellation. |
+| Integrated editor/native/viewer | Actual editor output crosses native parsing and atomic compare/update storage, then fresh-process viewer preference loading, real catalog maximum selection, CPU policy requests and fixed/Match fullscreen restoration. Independent pin/reminder updates survive a stale editor snapshot; stale resolution writes and forged invalid values are rejected; another VM remains isolated. |
+| Browser/JS suites | Full-DOM editor validation/warnings and platform gating; Edge editor/overlay layouts, explicit menu IDs, dwell/pin/checkmarks; syntax checks. |
+| Builds | Clean Release x64 app, core and actual VDD project builds. Driver signing is forced off; no submission, publishing or guest deployment. |
+
+The integration harness reuses the focused fullscreen fixture's synthetic monitor,
+window-manager and VM transport boundaries. It compiles actual viewer functions,
+command parser, preference storage and mode catalog. It runs against temporary VM
+directories and never starts a VM or changes host monitor modes. Its frontend
+helper is shared with the existing editor suite, so both execute the same HTML,
+validation and save path. All focused checks still run independently.
+
+For just that regression: `.\tools\tests\test-display-integration.ps1` (this also
+runs/generates the focused fullscreen policy harness). For only an unsigned driver
+rebuild: `.\tools\tests\build-display-driver.ps1 -WdkRoot bin/wdk`. Omit `-WdkRoot`
+for an installed WDK. The staged build uses the original
+`WindowsUserModeDriver10.0` toolset, x64 tool paths, SDK/WDK content version
+10.0.28000.0, `SignMode=Off`, and disabled Inf2Cat. The staging used here contains
+WDK NuGet 10.0.28000.2526 and SDK NuGet 10.0.28000.2957. Spectre libraries are absent
+in that tree, so its local build override disables Spectre mitigation. Normal
+release packaging/signing must use its usual qualified toolchain.
+
+The VDD DLL output is `tools/vdd/x64/Release/AppSandboxVDD.dll`; it is unsigned
+build evidence. DrvCat reports that it has no catalog to process in this mode.
+It does not establish a signed, deployable driver package. The app resource copy
+step is checked by its build, and its shared web assets are copied to `bin/Release/web`.
+
+The sections below retain historical per-child results. This integration pass
+supersedes their older missing-resource and WDK-environment limitations; those
+older failures are not represented as earlier successful checks. The registration
+audit corrected a stale core `src/ui.h` reference, added the app's resize header,
+and reconciled app filters with its source/header list.
+
+Validation recorded on 2026-11-20: all 18 runner checks passed (zero failures),
+including clean app/core/VDD rebuilds, source registration, browser checks, and the
+new cross-component regression. The driver compiler used `/W4 /WX /analyze`
+with Windows PREfast plugins, followed by Universal API validation. Exact commands,
+durations and logs are in the ignored `build/display-validation/results.json`.
+No signed deployable release package was produced. Native acceptance was not run.
+
+Native Windows 11 host/guest acceptance stays open in `AppSandbox-gfa.10`:
+physical mixed-DPI/hotplug, actual TaskDialog/Escape/focus/capture and HTTP client
+disconnects, GPU sharing/CPU fallback, placement, scaling, and Fluent rendering
+require separate runtime evidence. No signing submission, publishing or guest
+deployment is part of this runner.
+
+---
+
 # Windows display preference storage tests
+
+## Fullscreen resolution policy (gfa.6)
+
+Run `.\tools\tests\test-fullscreen-resolution.ps1`. It compiles the actual viewer
+preference loader, windowed/fullscreen evaluators, target selection, borderless
+fit/transition, aspect scaling and mouse mapping with MSVC `/W4 /WX`. Synthetic
+monitor APIs feed the real capability catalog builder and maximum selector.
+VM, overlay and window-manager operations are substituted; no VM is started and
+no host monitor modes are changed. Source checks cover monitor-move, DPI, display
+configuration and device-change events, actual-frame rendering/input wiring,
+project registration, and absence of host display-mode setters in the viewer.
+
+Coverage includes maximum versus current resolution, within-cap/equal-area
+ranking, smaller/larger/portrait target monitors, custom resolution retention,
+letterboxing, fresh same-monitor hotplug/DPI selection, recursion guards during
+window positioning, delayed CPU transport, stale in-flight transitions, rejection
+and reconnect suppression, and exact windowed placement/style restoration with
+Match both off and on, including maximized placement metadata. Frame/timer
+notifications evaluate cached targets without enumerating monitors or refitting
+the borderless window. Rejected targets leave actual frames and saved values intact.
+
+Automatic selection refreshes the host capability snapshot on fullscreen entry,
+target-monitor changes, DPI/display changes and device-node changes. Failure or
+absence of an in-cap maximum is logged and falls back to the target monitor's
+current desktop pixel dimensions, bounded to 640x480..7680x4320. Missing/invalid
+current dimensions fall back to 1920x1080. These fallbacks never replace the
+saved custom pair. Custom mode uses that pair on every monitor without capability
+enumeration. Viewer bounds always use the full monitor rectangle, independently
+of guest resolution and fallback limits. Windows fullscreen requests use fixed
+guest mode while preserving the session Match choice for exit.
+
+Validation on 2026-11-20: fullscreen and windowed policy suites, mode catalog,
+resize protocol and actual VDD-handler regressions passed. Release x64 app/core
+builds passed with the installed v145 override, including app resource copying.
+These establish policy, API wiring and build behavior; physical mixed-DPI/hotplug,
+native window placement/composition and real guest GPU/CPU resizing remain
+separate Windows 11 host/guest acceptance in `AppSandbox-gfa.10`.
 
 ## Saved windowed viewer policy (gfa.5)
 
@@ -302,3 +412,67 @@ changes are part of gfa.7. A headless screenshot was reviewed at
 WebView composition/focus behavior, physical DPI changes, macOS runtime behavior,
 or real Windows 11 host/guest acceptance; those remain qualification work in
 `AppSandbox-gfa.10`. Prerequisites gfa.5/gfa.6 were still open during this work.
+
+# Windows native fullscreen reminder and completion (gfa.8)
+
+```powershell
+.\tools\tests\test-fullscreen-entry.ps1
+.\tools\tests\test-display-settings.ps1
+.\tools\tests\test-fullscreen-resolution.ps1
+.\tools\tests\test-fullscreen-controls.ps1
+node tools/tests/fullscreen_controls_browser_test.cjs
+```
+
+The Windows viewer owns a native `TaskDialogIndirect` reminder titled Before
+entering fullscreen. It explains the half-second top-center reveal and pinning,
+indicates a currently pinned VM in its footer, and offers Enter fullscreen,
+Cancel, and an initially unchecked per-VM suppression checkbox. Escape, Alt-F4
+and title-bar close use the native Cancel result. A checked checkbox is saved
+through the shared preference setter only after confirmed, successful borderless
+entry. A failed save is logged and leaves the reminder enabled for a later entry.
+The preference is freshly read at every entry; read failures show the reminder.
+Exiting or requesting the existing fullscreen state does not prompt.
+
+Both the system-menu action and programmatic entry use the same gate. The gate
+prevents reentrant requests, cancels overlay input, releases held guest keys and
+mouse buttons/capture, removes the keyboard hook, and disables guest input routing
+until it finishes. Relative capture and keyboard routing are reevaluated afterward.
+Closing/stopping the viewer during the reminder cancels entry and defers owner
+teardown until the modal has returned.
+
+The previous one-second `SendMessageTimeoutW` call is replaced by reference-counted
+requests with completion events. A caller may supply a cancellation event through
+`vm_display_idd_set_fullscreen_cancellable`. Cancellation competes atomically with
+committing the transition; cancelled queued requests retain their viewer reference
+until discarded and cannot enter later. Running requests unwind their modal before
+reporting cancellation; callers wait for committed transitions and receive their
+actual result. `WM_QUIT` cancels waiting work and is preserved for the caller's
+outer loop. Viewer shutdown drains remaining request references. API calls watch
+HTTP connection disconnects and pass that event through the GUI/headless bridge;
+the overlapped watcher is cancelled and joined before its storage is released.
+
+The entry suite compiles the actual gate and input-send guard extracted from the
+viewer, plus its actual request helper, with MSVC `/W4 /WX`. It exercises real
+Win32 events, viewer/caller threads, message queues, and reference cleanup, while
+stubbing the TaskDialog response and VM/window transition boundaries. Coverage
+includes repeated entry/no-op/exit, native Cancel result mapping, checked cancel,
+failed entry, failed dialog/save/read, successful suppression, per-VM isolation,
+pinned explanation, pre-modal input release, blocked guest input with release
+packets permitted, duplicate requests, a response after more than one second,
+cancellation during a prompt, queued abandonment, cancellation after commit,
+`WM_QUIT`, and stable handle counts across 100 calls. A separate harness compiles
+the actual HTTP watcher with mocked HTTP I/O and checks disconnect/setup failure
+and cancellation-completion cleanup. Storage tests also reload suppression in a
+fresh process and verify an independent VM remains unsuppressed.
+
+Validation on 2026-11-20: entry/HTTP/storage and fullscreen policy/control
+regressions passed; Release x64 app and core built with `PlatformToolset=v145`.
+These are source, simulated-boundary and build checks. Actual TaskDialog rendering,
+physical Escape/focus/capture behavior, live HTTP disconnects and Windows 11
+guest behavior remain native qualification work in `AppSandbox-gfa.10`.
+
+Native API references:
+[TaskDialogIndirect](https://learn.microsoft.com/en-us/windows/win32/api/commctrl/nf-commctrl-taskdialogindirect),
+[TASKDIALOGCONFIG](https://learn.microsoft.com/en-us/windows/win32/api/commctrl/ns-commctrl-taskdialogconfig),
+[HttpWaitForDisconnect](https://learn.microsoft.com/en-us/windows/win32/api/http/nf-http-httpwaitfordisconnect),
+[CancelIoEx](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelioex).

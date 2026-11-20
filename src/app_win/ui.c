@@ -819,8 +819,13 @@ BOOL ui_display_is_fullscreen(UINT64 id)
 }
 BOOL ui_display_set_fullscreen(UINT64 id,BOOL enabled)
 {
+    return ui_display_set_fullscreen_cancellable(id,enabled,NULL);
+}
+BOOL ui_display_set_fullscreen_cancellable(UINT64 id,BOOL enabled,HANDLE cancel)
+{
     for (int i=0;i<ASB_MAX_VMS;++i)
-        if (g_display_vm_ids[i]==id && g_idd_displays[i]) return vm_display_idd_set_fullscreen(g_idd_displays[i],enabled);
+        if (g_display_vm_ids[i]==id && g_idd_displays[i])
+            return vm_display_idd_set_fullscreen_cancellable(g_idd_displays[i],enabled,cancel);
     return FALSE;
 }
 void ui_display_close(UINT64 id)

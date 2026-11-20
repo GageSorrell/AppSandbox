@@ -41,6 +41,8 @@ function harness(patch = {}, mac = false) {
     function enabled() {return !el('btn-save-edit-vm').disabled;}
     return {w,dom,el,event,open,change,update,save,enabled,commands,close() {dom.window.close();}};
 }
+module.exports = {harness, defaults, caps};
+if (require.main === module) {
 let h = harness(); h.open();
 assert.deepEqual(h.commands.map(m=>m.action), ['getDisplayCapabilities','getDisplaySettings']);
 assert.equal(h.el('edit-windowed-preset').value,'1920x1080');
@@ -137,3 +139,5 @@ for (const kind of ['windowed','fullscreen']) for (const control of ['preset','w
 }
 h.close();
 console.log('PASS resolution editor: full DOM, presets/custom, defaults, hidden retention, warnings, validation, conflicts, focus, lifecycle/platform gates, accessibility');
+
+}

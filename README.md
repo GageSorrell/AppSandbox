@@ -101,6 +101,47 @@ Want to give your old VM the new App Sandbox features? Download and run the new 
 
 When your VM is running and open, right clicking its title bar will show several options like transmit hotkeys, mute audio and match window size where your VM display dynamically resizes to your viewers size.
 
+## Windows 11 guest display settings
+
+Stop the VM and use its pencil editor to set **Windowed resolution**. It defaults
+to 1920x1080; choose a preset or **Custom…** and enter integer width and height.
+Supported dimensions are 640x480 through 7680x4320, inclusive. Invalid active
+values block saving. Two advisory warnings do not block saving: the selection
+exceeds the supported mode dimensions of every connected desktop monitor, or its
+width is below 1280 or height is below 720. Both warnings may appear together.
+If monitor detection fails, inputs stay intact and the editor reports that limits
+could not be checked. Unavailable saved sizes remain Custom rather than being
+clamped. These resolution controls apply to Windows 11 guests on Windows hosts.
+
+**Use custom fullscreen resolution** starts off. Automatic fullscreen chooses the
+target monitor's highest supported mode within the app's bounds, ranked by pixel
+count, then width and height. This can exceed the monitor's current desktop
+resolution; it does not change the host's display mode. Enable the override to
+use a saved fullscreen preset or Custom size instead, initially 1920x1080.
+Turning the override off preserves that custom pair. The borderless viewer fills
+the monitor and preserves the guest's aspect ratio, including letterboxing.
+
+Right-click the viewer title bar for **Match window size** and **Borderless
+fullscreen**. Match is a windowed, viewing-session choice; turning it off restores
+the saved windowed resolution. Fullscreen temporarily takes precedence. Exiting
+restores the previous window placement and the windowed policy, including Match
+if it was on. Reopening the viewer starts with the saved windowed resolution.
+
+A native **Before entering fullscreen** reminder appears before entry. Enter
+fullscreen confirms; Cancel, Escape, or closing the reminder leaves the viewer
+windowed. **Don't show this again for this VM** starts unchecked and is saved
+only after a successful confirmed entry. In fullscreen, hold the pointer at the
+top-center screen edge for half a second to reveal **Viewer options** and
+**Exit fullscreen**. The Windows exit button uses the BackToWindow icon. The first
+Viewer options item, **Pin fullscreen controls**, keeps both buttons visible;
+unpinning restores edge reveal. Pinning and reminder suppression persist per VM,
+independently of other VMs, alongside existing display preferences.
+
+Existing Windows guests require the matching updated display driver for the
+expanded range and CPU-frame resizing. Updating only the host does not update a
+guest. See [the guest upgrade instructions](VM-UPGRADE.md). A rejected or timed-out
+size keeps the last working guest display and is reported in the viewer log.
+
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well  
 
 [Windows] You can check if the GPU-PV driver setup is working by running gpu-test.exe inside your App Sandbox Windows VM, gpu-test.exe will show a box with 6 rotating cubes, each using a different rendering engine (D3D9, D3D10, D3D11, D3D12, OpenGL and Vulkan).  If one or more fail, they will not correctly show a rotating cube for that rendering API.  [gpu-test.zip](https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.2/gpu-test.zip). Note: The rendering API succeeding means that the GPU-PV worked, but sometimes games or apps are coded in such a way that they will not detect the GPU-PV system correctly and still show an error.

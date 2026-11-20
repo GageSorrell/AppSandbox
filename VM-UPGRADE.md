@@ -18,6 +18,24 @@ release; do not reuse an older signed VDD merely because its version string
 matches. Follow the authorized guest upgrade procedure below for existing VMs.
 This implementation does not install drivers or change host security policy.
 
+After an authorized upgrade, verify both a preset and a custom resolution,
+including CPU-frame resizing if shared GPU frames are unavailable. Use the stopped
+VM's pencil editor for saved windowed/custom fullscreen values. Dimensions are
+640x480..7680x4320; below 1280 width or 720 height is an advisory warning. Both
+resolution defaults are 1920x1080 and the fullscreen override starts disabled.
+Automatic fullscreen selects the target monitor's highest supported in-cap mode,
+which may exceed its current desktop mode, without changing the host mode.
+Verify fullscreen exit restores placement and a session Match window size choice.
+Check per-VM Pin fullscreen controls and the native reminder's suppression choice;
+both start disabled and persist independently of resolution edits. Full user
+controls are described in [the README](README.md#windows-11-guest-display-settings).
+
+The automated unsigned build check is not an installable signed release package.
+It does not submit signing requests, publish artifacts, deploy to a guest, or
+change security settings. Native Windows 11 host/guest qualification remains a
+separate acceptance gate; successful compilation and protocol tests do not prove
+physical monitor, focus, rendering or guest-driver behavior.
+
 Copy this prompt into Claude or Codex to update the guest components in an existing Windows or macOS VM.
 
 ```text

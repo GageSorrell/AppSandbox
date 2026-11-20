@@ -108,11 +108,11 @@ static BOOL display_is_fullscreen(UINT64 vm_id)
     DisplayEntry *e=display_find(vm_id);
     return e && vm_display_idd_is_fullscreen(e->disp);
 }
-static BOOL display_set_fullscreen(UINT64 vm_id,BOOL enabled)
+static BOOL display_set_fullscreen(UINT64 vm_id,BOOL enabled,HANDLE cancel)
 {
-    if (g_gui_hwnd) return ui_display_set_fullscreen(vm_id,enabled);
+    if (g_gui_hwnd) return ui_display_set_fullscreen_cancellable(vm_id,enabled,cancel);
     DisplayEntry *e=display_find(vm_id);
-    return e && vm_display_idd_set_fullscreen(e->disp,enabled);
+    return e && vm_display_idd_set_fullscreen_cancellable(e->disp,enabled,cancel);
 }
 /* If the user closed the window (X), vm_display_idd has already stopped its threads
    and freed the vsock frame connection (WM_CLOSE handler); drop our now-dead handle
@@ -363,6 +363,31 @@ static int build_host_info(char *buf, int cap)
 /* ---- HTTP helpers ---- */
 
 static HANDLE                 g_req_queue = NULL;
+/* A disconnected API caller must not leave a reminder that can enter later. */
+static BOOL display_set_fullscreen_for_request(UINT64 vm_id,BOOL enabled,HTTP_CONNECTION_ID connection)
+{
+    OVERLAPPED watch={0};
+    BOOL result;
+    ULONG status;
+    watch.hEvent=CreateEventW(NULL,TRUE,FALSE,NULL);
+    if (!watch.hEvent) return FALSE;
+    status=HttpWaitForDisconnect(g_req_queue,connection,&watch);
+    if (status!=NO_ERROR && status!=ERROR_IO_PENDING) {
+        CloseHandle(watch.hEvent);
+        return FALSE;
+    }
+    if (status==NO_ERROR) SetEvent(watch.hEvent);
+    result=display_set_fullscreen(vm_id,enabled,watch.hEvent);
+    if (status==ERROR_IO_PENDING) {
+        DWORD bytes;
+        CancelIoEx(g_req_queue,&watch);
+        /* OVERLAPPED and its event remain alive until cancellation completes. */
+        GetOverlappedResult(g_req_queue,&watch,&bytes,TRUE);
+    }
+    CloseHandle(watch.hEvent);
+    return result;
+}
+
 static HTTP_SERVER_SESSION_ID g_session;
 static HTTP_URL_GROUP_ID      g_url_group;
 static char                   g_token[48];
@@ -1705,8 +1730,8 @@ static int handle_request(PHTTP_REQUEST req)
                              "the connected Windows guest does not support watcher controls");
                 else if (FAILED(result))
                     send_err(req->RequestId, 409, "Conflict", "busy", "the guest agent is busy; retry shortly");
-                else if (has_fullscreen && !display_set_fullscreen(v->unique_id,fullscreen))
-                    send_err(req->RequestId,409,"Conflict","display_not_ready","the viewer overlay is not ready");
+                else if (has_fullscreen && !display_set_fullscreen_for_request(v->unique_id,fullscreen,req->ConnectionId))
+                    send_err(req->RequestId,409,"Conflict","display_not_ready","the fullscreen change was cancelled or the viewer is not ready");
                 else send_json(req->RequestId, 202, "Accepted", "{\"ok\":true,\"accepted\":true}");
                 return 0;
             }

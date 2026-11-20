@@ -1,0 +1,153 @@
+{
+  "completedUtc": "2026-11-20T22:28:44.8427274Z",
+  "visualStudio": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community",
+  "wdkRoot": "C:\\AppSandbox/bin/wdk",
+  "checks": [
+    {
+      "name": "source-registration",
+      "status": "passed",
+      "command": "node tools/tests/display_registration_test.cjs",
+      "seconds": 0.14,
+      "log": "C:\\AppSandbox\\build\\display-validation\\source-registration.log",
+      "failure": null
+    },
+    {
+      "name": "display-settings",
+      "status": "passed",
+      "command": ".\\tools/tests/test-display-settings.ps1 -VisualStudioPath \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\"",
+      "seconds": 5.17,
+      "log": "C:\\AppSandbox\\build\\display-validation\\display-settings.log",
+      "failure": null
+    },
+    {
+      "name": "display-modes",
+      "status": "passed",
+      "command": ".\\tools/tests/test-display-modes.ps1 -VisualStudioPath \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\"",
+      "seconds": 3.03,
+      "log": "C:\\AppSandbox\\build\\display-validation\\display-modes.log",
+      "failure": null
+    },
+    {
+      "name": "display-resolution-command",
+      "status": "passed",
+      "command": ".\\tools/tests/test-display-resolution-command.ps1 -VisualStudioPath \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\"",
+      "seconds": 3.06,
+      "log": "C:\\AppSandbox\\build\\display-validation\\display-resolution-command.log",
+      "failure": null
+    },
+    {
+      "name": "display-resize",
+      "status": "passed",
+      "command": ".\\tools/tests/test-display-resize.ps1 -VisualStudioPath \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\"",
+      "seconds": 2.87,
+      "log": "C:\\AppSandbox\\build\\display-validation\\display-resize.log",
+      "failure": null
+    },
+    {
+      "name": "windowed-resolution",
+      "status": "passed",
+      "command": ".\\tools/tests/test-windowed-resolution.ps1 -VisualStudioPath \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\"",
+      "seconds": 2.41,
+      "log": "C:\\AppSandbox\\build\\display-validation\\windowed-resolution.log",
+      "failure": null
+    },
+    {
+      "name": "fullscreen-controls",
+      "status": "passed",
+      "command": ".\\tools/tests/test-fullscreen-controls.ps1 -VisualStudioPath \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\"",
+      "seconds": 2.53,
+      "log": "C:\\AppSandbox\\build\\display-validation\\fullscreen-controls.log",
+      "failure": null
+    },
+    {
+      "name": "fullscreen-entry",
+      "status": "passed",
+      "command": ".\\tools/tests/test-fullscreen-entry.ps1 -VisualStudioPath \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\"",
+      "seconds": 4.6,
+      "log": "C:\\AppSandbox\\build\\display-validation\\fullscreen-entry.log",
+      "failure": null
+    },
+    {
+      "name": "display-integration",
+      "status": "passed",
+      "command": ".\\tools/tests/test-display-integration.ps1 -VisualStudioPath \"C:\\Program Files\\Microsoft Visual Studio\\18\\Community\"",
+      "seconds": 7.1,
+      "log": "C:\\AppSandbox\\build\\display-validation\\display-integration.log",
+      "failure": null
+    },
+    {
+      "name": "display_modes_bridge",
+      "status": "passed",
+      "command": "node tools/tests/display_modes_bridge_test.cjs",
+      "seconds": 0.11,
+      "log": "C:\\AppSandbox\\build\\display-validation\\display_modes_bridge.log",
+      "failure": null
+    },
+    {
+      "name": "display_resolution_editor",
+      "status": "passed",
+      "command": "node tools/tests/display_resolution_editor_test.cjs",
+      "seconds": 1.5,
+      "log": "C:\\AppSandbox\\build\\display-validation\\display_resolution_editor.log",
+      "failure": null
+    },
+    {
+      "name": "display_resolution_browser",
+      "status": "passed",
+      "command": "node tools/tests/display_resolution_browser_test.cjs",
+      "seconds": 1.68,
+      "log": "C:\\AppSandbox\\build\\display-validation\\display_resolution_browser.log",
+      "failure": null
+    },
+    {
+      "name": "fullscreen_controls_browser",
+      "status": "passed",
+      "command": "node tools/tests/fullscreen_controls_browser_test.cjs",
+      "seconds": 3.67,
+      "log": "C:\\AppSandbox\\build\\display-validation\\fullscreen_controls_browser.log",
+      "failure": null
+    },
+    {
+      "name": "javascript-syntax",
+      "status": "passed",
+      "command": "node --check web/app.js; node --check web/display-resolution.js",
+      "seconds": 0.2,
+      "log": "C:\\AppSandbox\\build\\display-validation\\javascript-syntax.log",
+      "failure": null
+    },
+    {
+      "name": "AppSandboxCore-build",
+      "status": "passed",
+      "command": "MSBuild AppSandboxCore.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v145 /v:minimal /nologo",
+      "seconds": 9.46,
+      "log": "C:\\AppSandbox\\build\\display-validation\\AppSandboxCore-build.log",
+      "failure": null
+    },
+    {
+      "name": "AppSandbox-build",
+      "status": "passed",
+      "command": "MSBuild AppSandbox.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v145 /v:minimal /nologo",
+      "seconds": 6.54,
+      "log": "C:\\AppSandbox\\build\\display-validation\\AppSandbox-build.log",
+      "failure": null
+    },
+    {
+      "name": "vdd-build",
+      "status": "passed",
+      "command": ".\\tools\\tests\\build-display-driver.ps1 -WdkRoot \"C:\\AppSandbox/bin/wdk\"",
+      "seconds": 6.01,
+      "log": "C:\\AppSandbox\\build\\display-validation\\vdd-build.log",
+      "failure": null
+    },
+    {
+      "name": "diff-check",
+      "status": "passed",
+      "command": "git diff --check",
+      "seconds": 0.1,
+      "log": "C:\\AppSandbox\\build\\display-validation\\diff-check.log",
+      "failure": null
+    }
+  ],
+  "nativeAcceptance": "not run; AppSandbox-gfa.10",
+  "signedReleasePackage": "not produced"
+}

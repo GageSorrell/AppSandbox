@@ -41,6 +41,10 @@ static int worker(const wchar_t *worker_disk, unsigned field)
 }
 int wmain(int argc, wchar_t **argv)
 {
+    if (argc == 3 && !wcscmp(argv[1], L"readreminder")) {
+        AsbDisplaySettings saved;
+        return FAILED(asb_display_settings_read(argv[2], &saved)) || !saved.suppress_fullscreen_reminder;
+    }
     if (argc == 3 && !wcscmp(argv[1], L"readpin")) {
         AsbDisplaySettings saved;
         return FAILED(asb_display_settings_read(argv[2], &saved)) || !saved.fullscreen_pinned;
@@ -188,6 +192,15 @@ int wmain(int argc, wchar_t **argv)
     OK(asb_display_settings_read(other_disk, &s)); CHECK(!s.fullscreen_pinned);
     OK(asb_display_settings_update(other_disk, ASB_DISPLAY_PIN, &s));
     CHECK(read_settings().fullscreen_pinned);
+    /* Reminder suppression shares the same per-VM file and survives restart. */
+    pin.suppress_fullscreen_reminder = TRUE;
+    OK(asb_display_settings_update(disk, ASB_DISPLAY_REMINDER, &pin));
+    swprintf_s(command, ARRAYSIZE(command), L"\"%s\" readreminder \"%s\"", exe, disk);
+    CHECK(CreateProcessW(exe, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &startup, &process));
+    CloseHandle(process.hThread);
+    CHECK(WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0);
+    CHECK(GetExitCodeProcess(process.hProcess, &code) && !code); CloseHandle(process.hProcess);
+    OK(asb_display_settings_read(other_disk, &s)); CHECK(!s.suppress_fullscreen_reminder);
     CHECK(DeleteFileW(other_path)); CHECK(RemoveDirectoryW(other_directory));
     pin.fullscreen_pinned = FALSE;
     OK(asb_display_settings_update(disk, ASB_DISPLAY_PIN, &pin));

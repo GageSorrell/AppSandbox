@@ -43,6 +43,8 @@
 #include "windowed_resolution.h"
 #include "fullscreen_resolution.h"
 #include <dbt.h>
+#include <commctrl.h>
+#include "fullscreen_request.h"
 #include "../core/api_json.h"
 #include "../../tools/transport/asb_automation.h"
 #include "vm_clipboard.h"
@@ -229,6 +231,8 @@ struct VmDisplayIdd {
     volatile BOOL stop;
     volatile LONG fullscreen;
     BOOL fullscreen_pinned;
+    BOOL fullscreen_entry_active,fullscreen_close_pending;
+    HWND fullscreen_dialog;
     BOOL fullscreen_override;
     UINT saved_fullscreen_width, saved_fullscreen_height;
     UINT fullscreen_target_width, fullscreen_target_height;
@@ -595,6 +599,9 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
 static BOOL send_input_locked(VmDisplayIdd *d,UINT32 type,UINT32 p1,UINT32 p2,UINT32 p3)
 {
     if (!d->input) return FALSE;
+    if (d->fullscreen_entry_active &&
+        !((type==INPUT_KEY || type==INPUT_KEY_PHYSICAL) && (p3&INPUT_KEY_UP)) &&
+        !(type==INPUT_MOUSE_BUTTON && !p2)) return FALSE;
     if (type==ASB_INPUT_USER_GRANT || type==ASB_INPUT_USER_REVOKE || type==ASB_INPUT_USER_CANCEL)
         return !asb_input_control(d->input,type,p1);
     InputPacket packet={INPUT_MAGIC,type,p1,p2,p3};
@@ -634,7 +641,7 @@ static void idd_update_relative_mouse(VmDisplayIdd *d)
     BOOL active = !d->stop && d->frame_connected && d->agent_control!=ASB_CONTROL_AGENT &&
                    d->mouse_version >= INPUT_MOUSE_VERSION &&
                    d->input_socket != INVALID_SOCKET && d->input_focused &&
-                   !d->input_menu_active && !d->input_sizing &&
+                   !d->input_menu_active && !d->input_sizing && !d->fullscreen_entry_active &&
                    GetForegroundWindow() == d->hwnd && !IsIconic(d->hwnd) &&
                    GetCursorPos(&pt) && WindowFromPoint(pt) == d->render_hwnd;
     BOOL capture = active && !d->cursor_visible;
@@ -759,6 +766,7 @@ static BOOL idd_is_reserved_hotkey(DWORD vk, BOOL alt_down)
    change can release anything still down. Runs on the window thread only. */
 static void idd_forward_key(VmDisplayIdd *d, DWORD vk, DWORD scan, BOOL ext, BOOL up)
 {
+    if (d->fullscreen_entry_active) return;
     UINT32 type = INPUT_KEY, index = vk;
     InputPacket pkt;
     AcquireSRWLockExclusive(&d->input_lock);
@@ -835,7 +843,7 @@ static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
         const KBDLLHOOKSTRUCT *k = (const KBDLLHOOKSTRUCT *)lp;
         BOOL up = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
         BOOL ext = (k->flags & LLKHF_EXTENDED) != 0;
-        BOOL focused = d->input_focused && GetForegroundWindow() == d->hwnd;
+        BOOL focused = !d->fullscreen_entry_active && d->input_focused && GetForegroundWindow() == d->hwnd;
         if (d->keyboard_version != INPUT_KEYBOARD_VERSION) {
             if (focused && d->transmit_hotkeys) {
                 idd_forward_key(d, k->vkCode, k->scanCode, ext, up);
@@ -907,7 +915,7 @@ static void idd_remove_kbd_hook(VmDisplayIdd *d)
 
 static void idd_update_kbd_hook(VmDisplayIdd *d)
 {
-    if (d->transmit_hotkeys || d->keyboard_version == INPUT_KEYBOARD_VERSION)
+    if (!d->stop && !d->fullscreen_entry_active && (d->transmit_hotkeys || d->keyboard_version == INPUT_KEYBOARD_VERSION))
         idd_install_kbd_hook(d);
     else
         idd_remove_kbd_hook(d);
@@ -3353,6 +3361,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     if (!d->hwnd) {
         ui_log(L"IDD: CreateWindowEx failed (0x%08X)", GetLastError());
         d->open = FALSE;
+        asb_fullscreen_discard_requests(WM_IDD_FULLSCREEN);
         if (SUCCEEDED(apartment)) CoUninitialize();
         return 1;
     }
@@ -3488,6 +3497,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         DestroyWindow(d->hwnd);
         d->hwnd = NULL;
         d->open = FALSE;
+        asb_fullscreen_discard_requests(WM_IDD_FULLSCREEN);
         if (SUCCEEDED(apartment)) CoUninitialize();
         return 1;
     }
@@ -3504,6 +3514,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    /* Quit can precede already-posted requests. Complete their retained references. */
+    asb_fullscreen_discard_requests(WM_IDD_FULLSCREEN);
     if (SUCCEEDED(apartment)) CoUninitialize();
     return 0;
 }
@@ -3614,6 +3626,83 @@ static BOOL idd_set_fullscreen(VmDisplayIdd *d,BOOL enabled)
     return d->fullscreen==enabled;
 }
 
+/* BEGIN FULLSCREEN ENTRY GATE */
+typedef struct IddFullscreenPrompt {
+    VmDisplayIdd *display;
+    AsbFullscreenRequest *request;
+} IddFullscreenPrompt;
+
+static HRESULT CALLBACK idd_fullscreen_dialog_callback(HWND hwnd,UINT notification,WPARAM wp,LPARAM lp,LONG_PTR data)
+{
+    IddFullscreenPrompt *prompt=(IddFullscreenPrompt*)data;
+    VmDisplayIdd *d=prompt->display;
+    (void)wp;(void)lp;
+    if (notification==TDN_CREATED) d->fullscreen_dialog=hwnd;
+    if ((notification==TDN_CREATED || notification==TDN_TIMER) &&
+        (d->stop || d->fullscreen_close_pending || asb_fullscreen_request_cancelled(prompt->request)))
+        SendMessageW(hwnd,TDM_CLICK_BUTTON,IDCANCEL,0);
+    if (notification==TDN_DESTROYED) d->fullscreen_dialog=NULL;
+    return S_OK;
+}
+
+static BOOL idd_request_fullscreen(VmDisplayIdd *d,BOOL enabled,AsbFullscreenRequest *request)
+{
+    AsbDisplaySettings settings;
+    BOOL checked=FALSE,result=FALSE;
+    if (d->fullscreen_entry_active || d->stop || !IsWindow(d->hwnd)) return FALSE;
+    if (asb_fullscreen_request_cancelled(request)) return FALSE;
+    if (d->fullscreen==enabled) return TRUE;
+    if (!enabled) return asb_fullscreen_request_commit(request) && idd_set_fullscreen(d,FALSE);
+    if (!agent_overlay_is_ready(d->agent_overlay)) return FALSE;
+    d->fullscreen_entry_active=TRUE;
+    idd_remove_kbd_hook(d);
+    agent_overlay_cancel_input(d->agent_overlay);
+    idd_flush_held_keys(d);
+    idd_flush_mouse_buttons(d);
+    idd_update_relative_mouse(d);
+    /* Read again for each entry, including suppression saved by another viewer. */
+    HRESULT hr=asb_vm_get_display_settings((AsbVm)asb_find_vm_by_id(d->vm_id),&settings);
+    if (FAILED(hr) || !settings.suppress_fullscreen_reminder) {
+        TASKDIALOG_BUTTON enter={IDOK,L"Enter fullscreen"};
+        TASKDIALOGCONFIG config={0};
+        IddFullscreenPrompt prompt={d,request};
+        int button=IDCANCEL;
+        config.cbSize=sizeof(config);
+        config.hwndParent=d->hwnd;
+        config.hInstance=d->hInstance;
+        config.dwFlags=TDF_ALLOW_DIALOG_CANCELLATION|TDF_POSITION_RELATIVE_TO_WINDOW|TDF_CALLBACK_TIMER;
+        config.dwCommonButtons=TDCBF_CANCEL_BUTTON;
+        config.pszWindowTitle=L"Before entering fullscreen";
+        config.pszMainInstruction=L"Before entering fullscreen";
+        config.pszContent=L"Fullscreen controls are hidden by default. Hold the pointer at the top-center screen edge for half a second to reveal Viewer options and Exit fullscreen. Use Pin fullscreen controls in Viewer options to keep both controls visible.";
+        if (d->fullscreen_pinned)
+            config.pszFooter=L"Pin fullscreen controls is currently enabled for this VM. Both controls will stay visible.";
+        config.cButtons=1;config.pButtons=&enter;config.nDefaultButton=IDOK;
+        config.pszVerificationText=L"Don't show this again for this VM";
+        config.pfCallback=idd_fullscreen_dialog_callback;config.lpCallbackData=(LONG_PTR)&prompt;
+        hr=TaskDialogIndirect(&config,&button,NULL,&checked);
+        d->fullscreen_dialog=NULL;
+        if (FAILED(hr)) idd_log(d,L"Could not show the fullscreen reminder (0x%08X).",hr);
+        if (FAILED(hr) || button!=IDOK) goto done;
+    }
+    if (d->stop || d->fullscreen_close_pending || !IsWindow(d->hwnd) ||
+        !asb_fullscreen_request_commit(request)) goto done;
+    result=idd_set_fullscreen(d,TRUE);
+    if (result && checked && FAILED(asb_vm_set_fullscreen_reminder_suppressed(
+            (AsbVm)asb_find_vm_by_id(d->vm_id),TRUE)))
+        idd_log(d,L"Could not save fullscreen reminder suppression; it will be shown again.");
+done:
+    d->fullscreen_entry_active=FALSE;
+    idd_update_kbd_hook(d);
+    idd_update_relative_mouse(d);
+    if (d->fullscreen_close_pending) {
+        d->fullscreen_close_pending=FALSE;
+        PostMessageW(d->hwnd,WM_CLOSE,0,0);
+    }
+    return result;
+}
+/* END FULLSCREEN ENTRY GATE */
+
 static void idd_viewer_option_state(VmDisplayIdd *d,UINT *enabled,UINT *checked)
 {
     *enabled=28 | (1u<<AGENT_VIEWER_OPTION_PIN);*checked=0;
@@ -3639,6 +3728,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    if (d && d->fullscreen_entry_active &&
+        ((msg>=WM_KEYFIRST && msg<=WM_KEYLAST) || (msg>=WM_MOUSEFIRST && msg<=WM_MOUSELAST) ||
+         msg==WM_INPUT || msg==WM_IDD_VIEWER_OPTIONS || msg==WM_IDD_TAKE_CONTROL)) return 0;
 
     if (d && (msg==WM_MOUSEMOVE || msg==WM_NCMOUSEMOVE)) agent_overlay_pointer_activity(d->agent_overlay);
     if (d && !d->mouse_buttons && agent_overlay_mouse(d->agent_overlay, msg, wp, lp)) return 0;
@@ -3669,7 +3762,15 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     case WM_IDD_FULLSCREEN:
-        return d && idd_set_fullscreen(d,!!wp);
+        if (lp) {
+            AsbFullscreenRequest *request=(AsbFullscreenRequest*)lp;
+            BOOL result=FALSE;
+            if (asb_fullscreen_request_begin(request) && d)
+                result=idd_request_fullscreen(d,!!wp,request);
+            asb_fullscreen_request_finish(request,result);
+            return result;
+        }
+        return d && idd_request_fullscreen(d,!!wp,NULL);
     case WM_IDD_TAKE_CONTROL:
         if (d) {
             if (wp == ASB_INPUT_USER_GRANT || wp == ASB_INPUT_USER_REVOKE || wp == ASB_INPUT_USER_CANCEL) {
@@ -3790,6 +3891,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
 
     case WM_CLOSE:
+        if (d && d->fullscreen_entry_active) {
+            d->fullscreen_close_pending=TRUE;
+            if (d->fullscreen_dialog) SendMessageW(d->fullscreen_dialog,TDM_CLICK_BUTTON,IDCANCEL,0);
+            return 0;
+        }
         if (d) {
             BOOL user_initiated = d->open;
 
@@ -4453,8 +4559,11 @@ BOOL vm_display_idd_is_fullscreen(VmDisplayIdd *display)
 
 BOOL vm_display_idd_set_fullscreen(VmDisplayIdd *display,BOOL enabled)
 {
-    DWORD_PTR result=FALSE;
+    return vm_display_idd_set_fullscreen_cancellable(display,enabled,NULL);
+}
+
+BOOL vm_display_idd_set_fullscreen_cancellable(VmDisplayIdd *display,BOOL enabled,HANDLE cancel)
+{
     if (!vm_display_idd_is_open(display)) return FALSE;
-    return SendMessageTimeoutW(display->hwnd,WM_IDD_FULLSCREEN,!!enabled,0,
-        SMTO_ABORTIFHUNG|SMTO_BLOCK,1000,&result) && result;
+    return asb_fullscreen_call(display->hwnd,WM_IDD_FULLSCREEN,enabled,cancel);
 }

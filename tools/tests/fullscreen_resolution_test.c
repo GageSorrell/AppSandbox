@@ -35,6 +35,9 @@ typedef struct VmDisplayIdd {
 } VmDisplayIdd;
 
 static AsbDisplaySettings preferences;
+#ifdef ASB_DISPLAY_INTEGRATION
+static wchar_t integration_disk[MAX_PATH];
+#endif
 static RECT bounds = {100,100,1100,800};
 static RECT monitor_bounds[2] = {{0,0,1920,1080},{1920,0,3200,1024}};
 static AsbDisplayMode modes[2][5] = {
@@ -51,7 +54,14 @@ static BOOL idd_fit_fullscreen(VmDisplayIdd *d,HMONITOR target);
 
 static void *asb_find_vm_by_id(UINT id) { (void)id; return &preferences; }
 static HRESULT asb_vm_get_display_settings(AsbVm vm, AsbDisplaySettings *out)
-{ (void)vm; *out=preferences; return S_OK; }
+{
+    (void)vm;
+#ifdef ASB_DISPLAY_INTEGRATION
+    return asb_display_settings_read(integration_disk,out);
+#else
+    *out=preferences; return S_OK;
+#endif
+}
 static void idd_log(VmDisplayIdd *d, const wchar_t *format, ...)
 { (void)d; (void)format; ++logs; }
 static HRESULT device(void *ctx, size_t index, wchar_t out[CCHDEVICENAME])
@@ -175,6 +185,7 @@ static void reset(VmDisplayIdd *d)
     current_monitor=(HMONITOR)1;
     active_viewer=d;
 }
+#ifndef ASB_DISPLAY_INTEGRATION
 int main(void)
 {
     VmDisplayIdd d;
@@ -257,6 +268,19 @@ int main(void)
     CHECK(enumerations==frees);
     DeleteCriticalSection(&d.frame_cs);
 
+    /* Successful enumeration without an in-cap maximum also uses the fallback. */
+    reset(&d);
+    modes[0][0]=(AsbDisplayMode){8000,6000};
+    modes[0][1]=(AsbDisplayMode){0,0};
+    monitor_bounds[0]=(RECT){0,0,500,400};
+    CHECK(idd_set_fullscreen(&d,TRUE));
+    CHECK(d.fullscreen_target_width==640 && d.fullscreen_target_height==480);
+    CHECK(EqualRect(&bounds,&monitor_bounds[0]));
+    DeleteCriticalSection(&d.frame_cs);
+    modes[0][0]=(AsbDisplayMode){1920,1080};
+    modes[0][1]=(AsbDisplayMode){3840,2160};
+    monitor_bounds[0]=(RECT){0,0,1920,1080};
+
     /* Rejection and reconnect preserve both target and the last actual frame. */
     reset(&d); CHECK(idd_set_fullscreen(&d,TRUE));
     CHECK(asb_resize_begin(&d.windows_resize_state,&d.size_request,100)==1);
@@ -297,7 +321,21 @@ int main(void)
     fit_failure=FALSE; overlay_ready=FALSE;
     CHECK(!idd_set_fullscreen(&d,TRUE) && !d.fullscreen);
     DeleteCriticalSection(&d.frame_cs);
+    /* Preserve maximized placement metadata and the original window style. */
+    overlay_ready=TRUE;
+    reset(&d);
+    placement.showCmd=SW_SHOWMAXIMIZED;
+    placement.ptMaxPosition=(POINT){-8,-8};
+    style=WS_OVERLAPPEDWINDOW|WS_MAXIMIZE;
+    CHECK(idd_set_fullscreen(&d,TRUE)); settle(&d);
+    CHECK(!(style&WS_MAXIMIZE));
+    CHECK(idd_set_fullscreen(&d,FALSE));
+    CHECK(placement.showCmd==SW_SHOWMAXIMIZED && placement.ptMaxPosition.x==-8);
+    CHECK(style==(WS_OVERLAPPEDWINDOW|WS_MAXIMIZE) && EqualRect(&bounds,&original));
+    DeleteCriticalSection(&d.frame_cs);
     CHECK(preferences.resolution.windowed_width==1365 && preferences.resolution.fullscreen_width==4096);
     puts("PASS fullscreen maximum/custom/fallback, monitor refresh, aspect/input, transport and placement restoration");
     return 0;
 }
+
+#endif
