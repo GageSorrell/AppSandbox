@@ -4498,6 +4498,95 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     return S_OK;
 }
 
+ASB_API HRESULT asb_get_host_display_capabilities(AsbDisplayCapabilities *out)
+{
+    return asb_display_capabilities_enumerate(out);
+}
+ASB_API void asb_free_host_display_capabilities(AsbDisplayCapabilities *caps)
+{
+    asb_display_capabilities_free(caps);
+}
+ASB_API BOOL asb_host_display_accommodates(const AsbDisplayCapabilities *caps, AsbDisplayMode mode)
+{
+    return asb_display_capabilities_accommodates(caps, mode);
+}
+ASB_API HRESULT asb_get_host_monitor_maximum(const AsbDisplayCapabilities *caps, HMONITOR monitor, AsbDisplayMode *out)
+{
+    if (!caps || !monitor || !out) return E_INVALIDARG;
+    *out = (AsbDisplayMode){0};
+    if (FAILED(caps->status)) return caps->status;
+    MONITORINFOEXW info = {0};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, (MONITORINFO *)&info)) {
+        DWORD error = GetLastError();
+        return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
+    }
+    return asb_display_capabilities_maximum(caps, info.szDevice, out);
+}
+
+ASB_API HRESULT asb_vm_get_display_settings(AsbVm vm, AsbDisplaySettings *out)
+{
+    int idx = vm_index_of(vm);
+    VmInstance *inst = idx >= 0 ? &VM_AT(idx) : NULL;
+    return inst ? asb_display_settings_read(inst->vhdx_path, out) : E_INVALIDARG;
+}
+static HRESULT set_display_resolution(AsbVm vm, const AsbDisplayResolution *value,
+                                      const AsbDisplayResolution *expected)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0 || !value) return E_INVALIDARG;
+    VmInstance *inst = &VM_AT(idx);
+    HRESULT hr = asb_display_resolution_edit(inst->vhdx_path, inst->running, inst->starting,
+                                             inst->building_vhdx, value, expected);
+    if (SUCCEEDED(hr)) notify_state(vm, inst->running, g_state_ud);
+    return hr;
+}
+ASB_API HRESULT asb_vm_set_display_resolution(AsbVm vm, const AsbDisplayResolution *value)
+{
+    return set_display_resolution(vm, value, NULL);
+}
+ASB_API HRESULT asb_vm_set_display_resolution_if_unchanged(AsbVm vm,
+    const AsbDisplayResolution *value, const AsbDisplayResolution *expected)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0 || !expected) return E_INVALIDARG;
+    VmInstance *inst = &VM_AT(idx);
+    if (_wcsicmp(inst->os_type, L"Windows")) return E_NOTIMPL;
+    return set_display_resolution(vm, value, expected);
+}
+ASB_API HRESULT asb_vm_set_display_hotkeys(AsbVm vm, BOOL enabled)
+{
+    int idx = vm_index_of(vm);
+    VmInstance *inst = idx >= 0 ? &VM_AT(idx) : NULL;
+    AsbDisplaySettings patch = {0};
+    patch.transmit_keyboard_hotkeys = enabled;
+    return inst ? asb_display_settings_update(inst->vhdx_path, ASB_DISPLAY_HOTKEYS, &patch) : E_INVALIDARG;
+}
+ASB_API HRESULT asb_vm_set_display_clipboard(AsbVm vm, BOOL enabled)
+{
+    int idx = vm_index_of(vm);
+    VmInstance *inst = idx >= 0 ? &VM_AT(idx) : NULL;
+    AsbDisplaySettings patch = {0};
+    patch.share_clipboard = enabled;
+    return inst ? asb_display_settings_update(inst->vhdx_path, ASB_DISPLAY_CLIPBOARD, &patch) : E_INVALIDARG;
+}
+ASB_API HRESULT asb_vm_set_fullscreen_pinned(AsbVm vm, BOOL enabled)
+{
+    int idx = vm_index_of(vm);
+    VmInstance *inst = idx >= 0 ? &VM_AT(idx) : NULL;
+    AsbDisplaySettings patch = {0};
+    patch.fullscreen_pinned = enabled;
+    return inst ? asb_display_settings_update(inst->vhdx_path, ASB_DISPLAY_PIN, &patch) : E_INVALIDARG;
+}
+ASB_API HRESULT asb_vm_set_fullscreen_reminder_suppressed(AsbVm vm, BOOL enabled)
+{
+    int idx = vm_index_of(vm);
+    VmInstance *inst = idx >= 0 ? &VM_AT(idx) : NULL;
+    AsbDisplaySettings patch = {0};
+    patch.suppress_fullscreen_reminder = enabled;
+    return inst ? asb_display_settings_update(inst->vhdx_path, ASB_DISPLAY_REMINDER, &patch) : E_INVALIDARG;
+}
+
 /* ---- Snapshots ---- */
 
 ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)

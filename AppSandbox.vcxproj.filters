@@ -18,6 +18,12 @@
     <ClCompile Include="src\app_win\main.c">
       <Filter>App</Filter>
     </ClCompile>
+    <ClCompile Include="src\app_win\display_resolution_command.c">
+      <Filter>App</Filter>
+    </ClCompile>
+    <ClCompile Include="src\app_win\display_capabilities_json.c">
+      <Filter>App</Filter>
+    </ClCompile>
     <ClCompile Include="src\app_win\ui.c">
       <Filter>App</Filter>
     </ClCompile>
@@ -32,6 +38,12 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\app_win\display_resolution_command.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\app_win\display_capabilities_json.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
     <ClInclude Include="src\app_win\resource.h">
       <Filter>Headers</Filter>
     </ClInclude>
@@ -60,6 +72,12 @@
       <Filter>Backend Win</Filter>
     </ClInclude>
     <ClInclude Include="src\backend_win\vm_display_idd.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
+    <ClInclude Include="src\backend_win\windowed_resolution.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
+    <ClInclude Include="src\backend_win\fullscreen_resolution.h">
       <Filter>Backend Win</Filter>
     </ClInclude>
   </ItemGroup>

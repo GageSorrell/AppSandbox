@@ -486,13 +486,16 @@ static BOOL VddHandleResize(VDD_SWAP_PROC* proc, AsbConn* connection, DisplayGpu
 {
     VDD_DEVICE_CONTEXT* ctx = proc->pOwner;
     HRESULT status = E_INVALIDARG;
-    if (request.session == proc->gpuSession && proc->gpuResizeSupported && ctx->hDisplayWork &&
+    BOOL windows = !asb_transport_is_ivshmem();
+    if (windows && !asb_windows_resize_packet(&request, proc->gpuSession)) {
+        status = E_INVALIDARG;
+    } else if (request.session == proc->gpuSession && proc->gpuResizeSupported && ctx->hDisplayWork &&
         !InterlockedCompareExchange(&ctx->stopping, 0, 0) &&
         request.slot <= DISPLAY_SIZE_WINDOW && request.width && request.height &&
         (!request.handle || (!asb_transport_is_ivshmem() && request.handle >= DISPLAY_MIN_REFRESH &&
                              request.handle <= DISPLAY_MAX_REFRESH)) &&
         request.width <= DISPLAY_MAX_WIDTH && request.height <= DISPLAY_MAX_HEIGHT &&
-        (request.slot == DISPLAY_SIZE_GUEST ||
+        (windows || request.slot == DISPLAY_SIZE_GUEST ||
          (request.width >= DISPLAY_MIN_WIDTH && request.height >= DISPLAY_MIN_HEIGHT))) {
         status = S_OK;
     }
@@ -645,6 +648,8 @@ static BOOL VddSendGpuPacket(VDD_SWAP_PROC* proc, UINT type, HRESULT status, UIN
     if (type == DISPLAY_GPU_CAPS) {
         packet.reserved = proc->pOwner->hDisplayWork ? DISPLAY_GPU_CAP_RESIZE : 0;
         packet.reserved |= DISPLAY_GPU_CAP_SNAPSHOT;
+        if (!asb_transport_is_ivshmem() && proc->pOwner->hDisplayWork)
+            packet.reserved |= DISPLAY_GPU_CAP_CPU_RESIZE;
         if (proc->pOwner->hDisplayWork && !asb_transport_is_ivshmem()) {
             packet.reserved |= DISPLAY_GPU_CAP_REFRESH;
             packet.handle = WdfObjectGet_MonitorContextWrapper(proc->hMonitor)->modes[0].refresh;
@@ -760,7 +765,13 @@ static void VddPollGpuControl(VDD_SWAP_PROC* proc)
             proc->gpuScreenshotSupported = (packet.reserved & DISPLAY_GPU_CAP_SNAPSHOT) != 0;
             proc->gpuResizeSupported = (packet.reserved & DISPLAY_GPU_CAP_RESIZE) != 0 &&
                 (!memory || (packet.reserved & DISPLAY_GPU_CAP_IVSHMEM) != 0);
-        } else if (memory && packet.type == DISPLAY_GPU_RESIZE && proc->bGpuCapsSent) {
+            proc->cpuResizeSupported = !memory && proc->pOwner->hDisplayWork &&
+                asb_windows_cpu_resize_capability(packet.version, packet.reserved);
+            if (proc->cpuResizeSupported) {
+                InterlockedExchange(&proc->pOwner->cpuResizeEnabled, TRUE);
+                WdfWorkItemEnqueue(proc->pOwner->hDisplayWork);
+            }
+        } else if ((memory || proc->cpuResizeSupported) && packet.type == DISPLAY_GPU_RESIZE && proc->bGpuCapsSent) {
             if (!VddHandleResize(proc, proc->hClientConn, packet)) {
                 VddCloseConn(&proc->hClientConn);
                 break;
@@ -846,6 +857,7 @@ static BOOL VddPublishGpuFrame(VDD_SWAP_PROC* proc, ID3D11Texture2D* source)
             proc->gpuBlockedSince = 0;
             ++proc->frameSeq;
             proc->bGpuHasFrame = TRUE;
+            InterlockedExchange(&proc->modeHasFrame, TRUE);
             proc->bGpuPendingFrame = FALSE;
             if (!proc->gpuModeNotified) {
                 proc->gpuModeNotified = TRUE;
@@ -914,7 +926,8 @@ static DWORD WINAPI VddSwapChainThread(LPVOID lpParameter)
         if (SUCCEEDED(hr)) {
             IDARG_IN_SETREALTIMEGPUPRIORITY priorityArgs = { 0 };
             priorityArgs.pDevice = pDxgiDevice;
-            IddCxSetRealtimeGPUPriority(proc->hSwapChain, &priorityArgs);
+            NTSTATUS priorityStatus = IddCxSetRealtimeGPUPriority(proc->hSwapChain, &priorityArgs);
+            if (!NT_SUCCESS(priorityStatus)) VddLog("GPU priority request failed 0x%08X", priorityStatus);
             pDxgiDevice->Release();
             pDxgiDevice = NULL;
         }
@@ -1123,6 +1136,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 proc->frameSeq = 0;
                 proc->gpuSession = 0;
                 proc->gpuResizeSupported = FALSE;
+                proc->cpuResizeSupported = FALSE;
                 proc->gpuScreenshotSupported = FALSE;
                 proc->bGpuCapsSent = FALSE;
                 proc->bGpuPoolFailed = FALSE;
@@ -1306,6 +1320,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                     if (SUCCEEDED(hr))
                     {
                         bHasFrame = TRUE;
+                        InterlockedExchange(&proc->modeHasFrame, TRUE);
 
                         if (proc->hClientConn != NULL)
                         {
@@ -1552,7 +1567,8 @@ static void VddContextInit(VDD_DEVICE_CONTEXT* ctx, WDFDEVICE device)
     InitializeSRWLock(&ctx->swapLock);
     InitializeSRWLock(&ctx->displayLock);
     InitializeSRWLock(&ctx->displayWorkLock);
-    CoCreateGuid(&ctx->monitorContainerId);
+    HRESULT containerStatus = CoCreateGuid(&ctx->monitorContainerId);
+    if (FAILED(containerStatus)) VddLog("Monitor container ID creation failed 0x%08X", containerStatus);
 }
 
 static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
@@ -1666,6 +1682,8 @@ static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx,
     UINT width = VDD_WIDTH, UINT height = VDD_HEIGHT, BOOL matchWindow = FALSE, UINT refresh = 60)
 {
     VddLog("CreateMonitor: entered (ctx=%p, adapter=%p)", (void*)ctx, (void*)ctx->hAdapter);
+    if (!asb_transport_is_ivshmem() && !asb_windows_display_dimensions(width, height))
+        return STATUS_INVALID_PARAMETER;
 
     IDDCX_MONITOR_INFO monitorInfo = {};
     monitorInfo.Size = sizeof(monitorInfo);
@@ -1759,7 +1777,10 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
         proc->bGpuPoolReady && proc->gpuResizeSupported &&
         !InterlockedCompareExchange(&proc->gpuIoFailed, 0, 0) &&
         proc->pDevice->GetDeviceRemovedReason() == S_OK;
-    BOOL available = gpu || (memory && proc && proc->gpuSession && proc->gpuResizeSupported &&
+    BOOL cpu = !memory && proc && proc->cpuResizeSupported && proc->hClientConn &&
+        proc->pDevice->GetDeviceRemovedReason() == S_OK;
+    BOOL preserveWindowsMode = !memory && InterlockedCompareExchange(&ctx->cpuResizeEnabled, 0, 0);
+    BOOL available = gpu || cpu || (memory && proc && proc->gpuSession && proc->gpuResizeSupported &&
         proc->hClientConn && proc->pDevice->GetDeviceRemovedReason() == S_OK);
     if (!available && monitor && ctx->gpuModes && ctx->reconfiguring &&
         (!proc || proc->pDevice->GetDeviceRemovedReason() == S_OK)) {
@@ -1772,7 +1793,7 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
     ReleaseSRWLockExclusive(&ctx->displayLock);
     if (request.type && (!proc || request.session != proc->gpuSession)) request.type = 0;
     InterlockedExchange(&ctx->gpuModes, gpu);
-    BOOL fullModes = gpu || memory;
+    BOOL fullModes = gpu || memory || preserveWindowsMode;
     BOOL modesChanged = InterlockedExchange(&ctx->fullModes, fullModes) != fullModes;
     if (!monitor) {
         ReleaseSRWLockExclusive(&ctx->swapLock);
@@ -1786,14 +1807,26 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
     UINT refresh = mon->modes[0].refresh;
     BOOL matchWindow = mon->matchWindow;
     BOOL recreate = !proc;
-    if (request.type && available && request.session == proc->gpuSession) {
+    BOOL rollback = !memory && ctx->resizeDeadline && GetTickCount64() >= ctx->resizeDeadline &&
+        (!proc || !InterlockedCompareExchange(&proc->modeHasFrame, 0, 0));
+    if (!memory && ctx->resizeDeadline && proc && InterlockedCompareExchange(&proc->modeHasFrame, 0, 0))
+        ctx->resizeDeadline = 0;
+    if (rollback) {
+        width = ctx->resizeRollback.width;
+        height = ctx->resizeRollback.height;
+        refresh = ctx->resizeRollback.refresh;
+        matchWindow = ctx->resizeRollbackMatch;
+        ctx->resizeDeadline = 0;
+        recreate = TRUE;
+        VddLog("Display: no frame after resize; restoring last working mode %ux%u", width, height);
+    } else if (request.type && available && request.session == proc->gpuSession) {
         matchWindow = request.slot == DISPLAY_SIZE_WINDOW;
         width = request.width;
         height = request.height;
         refresh = matchWindow && request.handle ? (UINT)request.handle : 60;
         recreate = refresh != mon->modes[0].refresh || matchWindow != mon->matchWindow ||
-            (matchWindow && (width != mon->modes[0].width || height != mon->modes[0].height));
-    } else if ((!memory && !available && (mon->matchWindow || refresh > 60)) || (!fullModes &&
+            ((matchWindow || !memory) && (width != mon->modes[0].width || height != mon->modes[0].height));
+    } else if ((!memory && !preserveWindowsMode && !available && (mon->matchWindow || refresh > 60)) || (!fullModes &&
         ((proc && (proc->width > VDD_WIDTH || proc->height > VDD_HEIGHT)) ||
          (!proc && (width > VDD_WIDTH || height > VDD_HEIGHT))))) {
         matchWindow = FALSE;
@@ -1803,7 +1836,20 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
         recreate = TRUE;
     }
     ResolutionEntry previous = mon->modes[0];
+    if (!memory && proc) {
+        previous.width = proc->width;
+        previous.height = proc->height;
+    }
     BOOL previousMatch = mon->matchWindow;
+    if (rollback) {
+        previous = ctx->resizeRollback;
+        previousMatch = ctx->resizeRollbackMatch;
+    }
+    if (!memory && recreate && request.type && !rollback) {
+        ctx->resizeRollback = previous;
+        ctx->resizeRollbackMatch = previousMatch;
+        ctx->resizeDeadline = GetTickCount64() + ASB_RESIZE_TIMEOUT_MS;
+    }
     if (recreate) {
         InterlockedExchange(&ctx->reconfiguring, 1);
         ctx->hMonitor = NULL;
@@ -1826,12 +1872,14 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
         status = VddCreateMonitor(ctx, width, height, matchWindow, refresh);
         if (!NT_SUCCESS(status)) {
             VddLog("Display: resize failed 0x%08X; restoring monitor", status);
-            status = VddCreateMonitor(ctx, available ? previous.width : VDD_WIDTH,
-                available ? previous.height : VDD_HEIGHT, available && previousMatch,
-                available ? previous.refresh : 60);
+            ctx->resizeDeadline = 0;
+            BOOL restorePrevious = !memory || available;
+            status = VddCreateMonitor(ctx, restorePrevious ? previous.width : VDD_WIDTH,
+                restorePrevious ? previous.height : VDD_HEIGHT, restorePrevious && previousMatch,
+                restorePrevious ? previous.refresh : 60);
         }
         if (ctx->hRecoveryTimer)
-            WdfTimerStart(ctx->hRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(NT_SUCCESS(status) ? 5 : 2));
+            WdfTimerStart(ctx->hRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(ctx->resizeDeadline ? 15 : NT_SUCCESS(status) ? 5 : 2));
     } else if (modesChanged) {
         InterlockedExchange(&ctx->reconfiguring, 1);
         ResolutionEntry resolutions[VDD_MAX_MODES];
@@ -1871,6 +1919,7 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
     }
 }
 
+static EVT_WDF_WORKITEM VddDisplayWork;
 static VOID VddDisplayWork(WDFWORKITEM work)
 {
     VDD_DEVICE_CONTEXT* ctx = WdfObjectGet_IndirectDeviceContextWrapper(
@@ -1887,6 +1936,7 @@ static VOID VddDisplayWork(WDFWORKITEM work)
 /*  crash when called from raw CreateThread threads in UMDF.                 */
 /* ========================================================================= */
 
+static EVT_WDF_TIMER VddRecoveryTimerCallback;
 static VOID VddRecoveryTimerCallback(WDFTIMER Timer)
 {
     RecoveryTimerContext* timerCtx = WdfObjectGet_RecoveryTimerContext(Timer);
@@ -1906,6 +1956,11 @@ static VOID VddRecoveryTimerCallback(WDFTIMER Timer)
         proc->pDevice->GetDeviceRemovedReason() == S_OK;
     InterlockedExchange(&ctx->reconfiguring, 0);
     BOOL update = !ctx->hMonitor || !proc || (!ready && ctx->gpuModes);
+    if (!asb_transport_is_ivshmem() && ctx->resizeDeadline) {
+        if (proc && InterlockedCompareExchange(&proc->modeHasFrame, 0, 0)) ctx->resizeDeadline = 0;
+        else if (GetTickCount64() >= ctx->resizeDeadline) update = TRUE;
+        else WdfTimerStart(ctx->hRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(1));
+    }
     AcquireSRWLockExclusive(&ctx->displayLock);
     if (update) ctx->gpuModeSession = 0;
     update = update || ctx->displayRequest.type != 0;
@@ -2052,6 +2107,9 @@ static NTSTATUS VddAssignSwapChain(
     ctx->pSwapProc = proc;
 
     asb_vdd_screenshot_start(&proc->screenshot);
+    if (!asb_transport_is_ivshmem() && ctx->hRecoveryTimer &&
+        InterlockedCompareExchange(&ctx->cpuResizeEnabled, 0, 0))
+        WdfTimerStart(ctx->hRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(15));
 
     VddLog("AssignSwapChain: COMPLETE — swap chain assigned, all threads started");
     return STATUS_SUCCESS;
@@ -2440,6 +2498,7 @@ NTSTATUS VddDeviceD0Entry(
 /*  WDF: EvtCleanupCallback                                                  */
 /* ========================================================================= */
 
+static EVT_WDF_OBJECT_CONTEXT_CLEANUP EvtCleanupCallback;
 static void EvtCleanupCallback(WDFOBJECT Object)
 {
     VddLog("EvtCleanupCallback: entered (Object=%p)", (void*)Object);
@@ -2611,7 +2670,11 @@ extern "C" BOOL WINAPI DllMain(
     UNREFERENCED_PARAMETER(lpReserved);
     if (dwReason == DLL_PROCESS_ATTACH) {
         WSADATA wsa;
-        WSAStartup(MAKEWORD(2, 2), &wsa);
+        int socketStatus = WSAStartup(MAKEWORD(2, 2), &wsa);
+        if (socketStatus) {
+            VddLog("DllMain: WSAStartup failed %d", socketStatus);
+            return FALSE;
+        }
         VddLog("DllMain: DLL_PROCESS_ATTACH (WSAStartup done)");
     } else if (dwReason == DLL_PROCESS_DETACH) {
         VddLog("DllMain: DLL_PROCESS_DETACH");

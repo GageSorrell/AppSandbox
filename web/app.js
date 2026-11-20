@@ -6,6 +6,8 @@ let vms = [];
 let selectedVm = -1;
 let selectedSnap = new Map();
 let editVmState = null;
+/* Host capability snapshots never replace saved resolution preferences. */
+let hostDisplayCapabilities = { ok: false, errorCode: null, monitors: [], presets: [] };
 let snapshotModal = null;
 let pendingConfirm = null; /* {resolve} */
 let minSizeReported = false;
@@ -153,6 +155,12 @@ window.onHostMessage = function(msg) {
         case 'vmStateChanged': onVmStateChanged(msg); break;
         case 'snapListChanged': break;
         case 'log':           appendLog(msg.message); break;
+        case 'displayCapabilities':
+            if (!hostBridge.isMac) {
+                hostDisplayCapabilities = msg;
+                if (editVmState) updateEditVmModal();
+            }
+            break;
         case 'hostInfo':      updateHostInfo(msg); break;
         case 'browseResult':  onBrowseResult(msg.path); break;
         case 'diskDirectoryBrowseResult': onDiskDirectoryBrowseResult(msg.path); break;
@@ -1240,8 +1248,18 @@ function vmIndexById(id) {
 
 function openEditVmModal(idx) {
     var vm = vms[idx];
-    if (!vm || vm.running || vm.buildingVhdx) return;
+    if (!vm || vm.running || vm.starting || vm.buildingVhdx) return;
     editVmState = { id: vm.id, name: vm.name, initial: Object.assign({}, vm), previousFocus: rowCache[vm.id].querySelector('.edit') };
+    editVmState.initial.displayResolution = DisplayResolution.normalized(vm.displayResolution);
+    editVmState.customSelected = {windowed:false, fullscreen:false};
+    editVmState.catalog = null;
+    setEditDisplayResolution(editVmState.initial.displayResolution);
+    document.getElementById('edit-display-settings').hidden = !editDisplayAvailable(vm);
+    if (editDisplayAvailable(vm)) {
+        hostDisplayCapabilities = {ok:false, errorCode:null, monitors:[], presets:[]};
+        sendCmd('getDisplayCapabilities');
+        sendCmd('getDisplaySettings', {vmId:vm.id});
+    }
     document.getElementById('edit-vm-title').textContent = 'Edit ' + vm.name;
     document.getElementById('edit-ram-size').value = vm.ramMb;
     document.getElementById('edit-ram-size').min = 4096;
@@ -1270,6 +1288,78 @@ function restoreVmModalFocus(state, selector) {
     target.focus();
 }
 
+function editDisplayAvailable(vm) {
+    return !hostBridge.isMac && vm && vm.osType === 'windows11';
+}
+function editResolutionPair(kind) {
+    return {width:DisplayResolution.dimension(document.getElementById('edit-' + kind + '-width').value),
+        height:DisplayResolution.dimension(document.getElementById('edit-' + kind + '-height').value)};
+}
+function setEditDisplayResolution(value) {
+    ['windowed', 'fullscreen'].forEach(function(kind) {
+        document.getElementById('edit-' + kind + '-width').value = value[kind + 'Width'];
+        document.getElementById('edit-' + kind + '-height').value = value[kind + 'Height'];
+        editVmState.customSelected[kind] = false;
+    });
+    document.getElementById('edit-fullscreen-override').checked = value.fullscreenOverride;
+    editVmState.lastValidFullscreen = {width:value.fullscreenWidth, height:value.fullscreenHeight};
+    refreshEditResolutionPresets();
+}
+function refreshEditResolutionPresets() {
+    ['windowed', 'fullscreen'].forEach(function(kind) {
+        var select = document.getElementById('edit-' + kind + '-preset');
+        var pair = editResolutionPair(kind);
+        var selected = pair.width + 'x' + pair.height;
+        var presets = hostDisplayCapabilities.ok ? hostDisplayCapabilities.presets : [];
+        select.replaceChildren();
+        presets.forEach(function(mode) {
+            var option = document.createElement('option');
+            option.value = mode.width + 'x' + mode.height;
+            option.textContent = mode.width + ' × ' + mode.height;
+            select.appendChild(option);
+        });
+        var custom = document.createElement('option');
+        custom.value = 'custom'; custom.textContent = 'Custom…'; select.appendChild(custom);
+        select.value = !editVmState.customSelected[kind] && presets.some(function(mode) {
+            return mode.width === pair.width && mode.height === pair.height;
+        }) ? selected : 'custom';
+    });
+    editVmState.catalog = hostDisplayCapabilities;
+}
+function editDisplayResolutionValue() {
+    var windowed = editResolutionPair('windowed');
+    var fullscreen = editResolutionPair('fullscreen');
+    var override = document.getElementById('edit-fullscreen-override').checked;
+    if (override && DisplayResolution.validPair(fullscreen.width, fullscreen.height))
+        editVmState.lastValidFullscreen = fullscreen;
+    if (!override) fullscreen = editVmState.lastValidFullscreen;
+    return {windowedWidth:windowed.width, windowedHeight:windowed.height, fullscreenOverride:override,
+        fullscreenWidth:fullscreen.width, fullscreenHeight:fullscreen.height};
+}
+function updateEditResolutionWarnings(value) {
+    document.getElementById('edit-fullscreen-settings').hidden = !value.fullscreenOverride;
+    document.getElementById('edit-display-capability').textContent = hostDisplayCapabilities.ok ? '' :
+        hostDisplayCapabilities.errorCode === null ? 'Checking connected monitor modes…' : 'Monitor limits could not be checked.';
+    var invalid = false;
+    ['windowed', 'fullscreen'].forEach(function(kind) {
+        var active = kind === 'windowed' || value.fullscreenOverride;
+        var width = value[kind + 'Width'], height = value[kind + 'Height'];
+        var valid = DisplayResolution.validPair(width, height);
+        var error = active && !valid ? 'Enter whole-number dimensions: width 640–7680 and height 480–4320.' : '';
+        document.getElementById('edit-' + kind + '-custom').hidden =
+            document.getElementById('edit-' + kind + '-preset').value !== 'custom';
+        var warnings = active ? DisplayResolution.warnings(width, height, hostDisplayCapabilities) : {limit:'', small:''};
+        document.getElementById('edit-' + kind + '-error').textContent = error;
+        document.getElementById('edit-' + kind + '-limit').textContent = warnings.limit;
+        document.getElementById('edit-' + kind + '-small').textContent = warnings.small;
+        ['preset', 'width', 'height'].forEach(function(control) {
+            document.getElementById('edit-' + kind + '-' + control).setAttribute('aria-invalid', error ? 'true' : 'false');
+        });
+        invalid = invalid || !!error;
+    });
+    return invalid ? 'Fix the highlighted resolution dimensions.' : '';
+}
+
 function editVmValues() {
     var values = {
         ramMb: document.getElementById('edit-ram-size').valueAsNumber,
@@ -1279,6 +1369,8 @@ function editVmValues() {
         Object.assign(values, selectedGpu('edit-gpu-mode'));
         values.networkMode = Number(document.getElementById('edit-net-mode').value);
     }
+    if (editVmState && editDisplayAvailable(vms[vmIndexById(editVmState.id)]))
+        values.displayResolution = editDisplayResolutionValue();
     return values;
 }
 
@@ -1319,13 +1411,29 @@ function updateEditVmModal() {
             editVmState.initial.gpuId = vm.gpuId;
         }
     }
+    var resolutionError = '';
+    if (editDisplayAvailable(vm)) {
+        var latest = DisplayResolution.normalized(vm.displayResolution);
+        var initial = editVmState.initial.displayResolution;
+        if (!DisplayResolution.equal(latest, initial)) {
+            if (!DisplayResolution.equal(values.displayResolution, initial) &&
+                !DisplayResolution.equal(values.displayResolution, latest)) conflict = true;
+            else {
+                editVmState.initial.displayResolution = latest;
+                setEditDisplayResolution(latest);
+            }
+        }
+        if (editVmState.catalog !== hostDisplayCapabilities) refreshEditResolutionPresets();
+        resolutionError = updateEditResolutionWarnings(editDisplayResolutionValue());
+        if (vm.displaySettingsError) resolutionError = 'Display settings could not be read. Check the VM storage before saving.';
+    }
     var disabled = vm.running || vm.buildingVhdx || vm.starting;
     document.querySelectorAll('#edit-vm-overlay input, #edit-vm-overlay select').forEach(function(el) {
         el.disabled = !!disabled;
     });
     var values = editVmValues();
     var error = disabled ? 'Stop the VM before editing its configuration.' :
-        conflict ? 'These settings changed in another interface. Reopen this editor to review the latest values.' : editVmValidationError(values);
+        conflict ? 'These settings changed in another interface. Reopen this editor to review the latest values.' : editVmValidationError(values) || resolutionError;
     document.getElementById('edit-vm-warn').textContent = error;
     document.getElementById('btn-save-edit-vm').disabled = !!error;
 }
@@ -1341,16 +1449,34 @@ function saveEditVm() {
         gpuSelectionValue(values) !== gpuSelectionValue(editVmState.initial) &&
         gpuSelectionValue(values) !== gpuSelectionValue(vms[idx]);
     var fields = Object.keys(values).filter(function(field) {
-        return field !== 'gpuMode' && field !== 'gpuId' &&
+        return field !== 'gpuMode' && field !== 'gpuId' && field !== 'displayResolution' &&
             values[field] !== editVmState.initial[field] && values[field] !== vms[idx][field];
     });
+    var resolutionChanged = values.displayResolution &&
+        !DisplayResolution.equal(values.displayResolution, editVmState.initial.displayResolution);
+    var expectedResolution = editVmState.initial.displayResolution;
     closeEditVmModal();
+    if (resolutionChanged) sendCmd('setDisplayResolution', {vmId:vms[idx].id,
+        resolution:values.displayResolution, expected:expectedResolution});
     fields.forEach(function(field) {
         sendCmd('editVm', { vmId: vms[idx].id, field: field, value: String(values[field]) });
     });
     if (gpuChanged)
         sendCmd('editVm', { vmId: vms[idx].id, field: 'gpuMode', value: String(values.gpuMode), gpuId: values.gpuId });
 }
+
+['windowed', 'fullscreen'].forEach(function(kind) {
+    document.getElementById('edit-' + kind + '-preset').addEventListener('change', function() {
+        if (!editVmState) return;
+        editVmState.customSelected[kind] = this.value === 'custom';
+        if (this.value !== 'custom') {
+            var pair = this.value.split('x');
+            document.getElementById('edit-' + kind + '-width').value = pair[0];
+            document.getElementById('edit-' + kind + '-height').value = pair[1];
+        }
+        updateEditVmModal();
+    });
+});
 
 document.getElementById('edit-vm-overlay').addEventListener('input', updateEditVmModal);
 document.getElementById('edit-vm-overlay').addEventListener('change', updateEditVmModal);

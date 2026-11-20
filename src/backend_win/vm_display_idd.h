@@ -23,4 +23,9 @@ BOOL vm_display_idd_set_fullscreen(VmDisplayIdd *display, BOOL enabled);
    Safe to call from any thread; the work is marshaled to the window thread. */
 void vm_display_idd_focus(VmDisplayIdd *display);
 
+/* Queue a Windows guest mode on the negotiated GPU or CPU control channel.
+   S_OK means queued; actual completion requires frames at the requested mode.
+   Unavailable/legacy guests and repeated failed targets return a failure HRESULT. */
+HRESULT vm_display_idd_request_resolution(VmDisplayIdd *display, UINT width, UINT height);
+
 #endif /* VM_DISPLAY_IDD_H */

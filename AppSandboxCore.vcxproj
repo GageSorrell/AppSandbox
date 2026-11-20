@@ -167,6 +167,9 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\core\api_json.c" />
+    <ClCompile Include="src\backend_win\display_settings.c" />
+    <ClCompile Include="src\backend_win\display_modes.c" />
     <ClCompile Include="src\core\asb_events.c" />
     <ClCompile Include="src\core\input_router.c" />
     <ClCompile Include="src\backend_win\headless_transport.c" />
@@ -195,6 +198,10 @@
     <ClCompile Include="tools\transport\asb_clipboard_temp.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\backend_win\display_settings.h" />
+    <ClInclude Include="src\backend_win\display_modes.h" />
+    <ClInclude Include="tools\transport\asb_display_resolutions.h" />
+    <ClInclude Include="src\core\api_json.h" />
     <ClInclude Include="src\core\asb_events.h" />
     <ClInclude Include="src\core\win_file_hash.h" />
     <ClInclude Include="src\core\input_router.h" />

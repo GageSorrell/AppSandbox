@@ -230,6 +230,41 @@
                     </select>
                 </div>
             </div>
+            <div id="edit-display-settings" hidden role="group" aria-labelledby="edit-display-title">
+                <h4 id="edit-display-title">Display resolution</h4>
+                <p id="edit-display-capability" class="field-warn" aria-live="polite"></p>
+                <div class="resolution-control">
+                    <label for="edit-windowed-preset">Windowed resolution</label>
+                    <select id="edit-windowed-preset" aria-describedby="edit-windowed-error edit-windowed-limit edit-windowed-small edit-display-capability"><option value="custom">Custom…</option></select>
+                    <div id="edit-windowed-custom" class="resolution-dimensions" hidden>
+                        <label for="edit-windowed-width">Width</label>
+                        <input type="number" id="edit-windowed-width" min="640" max="7680" step="1" inputmode="numeric" aria-describedby="edit-windowed-error edit-windowed-limit edit-windowed-small edit-display-capability">
+                        <span aria-hidden="true">×</span>
+                        <label for="edit-windowed-height">Height</label>
+                        <input type="number" id="edit-windowed-height" min="480" max="4320" step="1" inputmode="numeric" aria-describedby="edit-windowed-error edit-windowed-limit edit-windowed-small edit-display-capability">
+                    </div>
+                    <p id="edit-windowed-error" class="field-warn" aria-live="polite"></p>
+                    <p id="edit-windowed-limit" class="field-warn" aria-live="polite"></p>
+                    <p id="edit-windowed-small" class="field-warn" aria-live="polite"></p>
+                </div>
+                <label class="resolution-override"><input type="checkbox" id="edit-fullscreen-override" aria-controls="edit-fullscreen-settings"> Use custom fullscreen resolution</label>
+                <div id="edit-fullscreen-settings" hidden>
+                <div class="resolution-control">
+                    <label for="edit-fullscreen-preset">Fullscreen resolution</label>
+                    <select id="edit-fullscreen-preset" aria-describedby="edit-fullscreen-error edit-fullscreen-limit edit-fullscreen-small edit-display-capability"><option value="custom">Custom…</option></select>
+                    <div id="edit-fullscreen-custom" class="resolution-dimensions" hidden>
+                        <label for="edit-fullscreen-width">Width</label>
+                        <input type="number" id="edit-fullscreen-width" min="640" max="7680" step="1" inputmode="numeric" aria-describedby="edit-fullscreen-error edit-fullscreen-limit edit-fullscreen-small edit-display-capability">
+                        <span aria-hidden="true">×</span>
+                        <label for="edit-fullscreen-height">Height</label>
+                        <input type="number" id="edit-fullscreen-height" min="480" max="4320" step="1" inputmode="numeric" aria-describedby="edit-fullscreen-error edit-fullscreen-limit edit-fullscreen-small edit-display-capability">
+                    </div>
+                    <p id="edit-fullscreen-error" class="field-warn" aria-live="polite"></p>
+                    <p id="edit-fullscreen-limit" class="field-warn" aria-live="polite"></p>
+                    <p id="edit-fullscreen-small" class="field-warn" aria-live="polite"></p>
+                </div>
+                </div>
+            </div>
             <span id="edit-vm-warn" class="field-warn" aria-live="polite"></span>
         </div>
         <div class="modal-buttons">
@@ -276,6 +311,7 @@
     </div>
 </div>
 
+<script src="display-resolution.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

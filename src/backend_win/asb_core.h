@@ -206,6 +206,31 @@ ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode);
 ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *gpu_id);
 ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
 
+/* ---- Windows host monitor capabilities (read-only, fresh snapshots) ---- */
+#include "display_modes.h"
+/* Initialize a new snapshot; release with asb_free_host_display_capabilities
+ * before reusing it. Failure is explicit and returns no partial catalog. */
+ASB_API HRESULT asb_get_host_display_capabilities(AsbDisplayCapabilities *out);
+ASB_API void asb_free_host_display_capabilities(AsbDisplayCapabilities *caps);
+ASB_API BOOL asb_host_display_accommodates(const AsbDisplayCapabilities *caps, AsbDisplayMode mode);
+/* Select from this snapshot for a target HMONITOR; no current-mode fallback. */
+ASB_API HRESULT asb_get_host_monitor_maximum(const AsbDisplayCapabilities *caps, HMONITOR monitor, AsbDisplayMode *out);
+
+/* ---- Persistent Windows display preferences ---- */
+#include "display_settings.h"
+ASB_API HRESULT asb_vm_get_display_settings(AsbVm vm, AsbDisplaySettings *out);
+/* Resolution is one validated update; VM must be stopped, not starting/building.
+ * Other preferences may be changed during a viewer session. Getters return a
+ * snapshot: use individual setters, never write a cached snapshot back. */
+ASB_API HRESULT asb_vm_set_display_resolution(AsbVm vm, const AsbDisplayResolution *value);
+/* Editor compare/update; returns ERROR_REVISION_MISMATCH if another writer won. */
+ASB_API HRESULT asb_vm_set_display_resolution_if_unchanged(AsbVm vm,
+    const AsbDisplayResolution *value, const AsbDisplayResolution *expected);
+ASB_API HRESULT asb_vm_set_display_hotkeys(AsbVm vm, BOOL enabled);
+ASB_API HRESULT asb_vm_set_display_clipboard(AsbVm vm, BOOL enabled);
+ASB_API HRESULT asb_vm_set_fullscreen_pinned(AsbVm vm, BOOL enabled);
+ASB_API HRESULT asb_vm_set_fullscreen_reminder_suppressed(AsbVm vm, BOOL enabled);
+
 /* ---- Snapshots ---- */
 
 ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name);

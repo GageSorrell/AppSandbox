@@ -1,5 +1,23 @@
 # VM upgrade prompt
 
+Windows resolution settings from 640x480 through 7680x4320 (including custom
+sizes and CPU frame transport) require the matching updated AppSandboxVDD in
+the guest. Updating only the host application does not update an existing guest
+driver. Older guests keep their working display; CPU resize is unavailable and
+legacy GPU resize retains its 1024x768 minimum. Incompatible protocol versions
+fall back to CPU frames without resize. The viewer log reports unavailable,
+rejected, and timed-out requests. A failed target is suppressed for that viewer
+session, including reconnects; choose a different size or reopen the viewer
+after updating the guest to retry.
+
+The existing driver package project builds AppSandboxVDD.dll, INF, catalog and
+certificate into `bin/<configuration>/drivers/` (or the ARM64 variant). Release
+packaging includes that directory, and ISO/VHDX provisioning stages those files
+for guest setup. Build the driver package from this source when preparing a
+release; do not reuse an older signed VDD merely because its version string
+matches. Follow the authorized guest upgrade procedure below for existing VMs.
+This implementation does not install drivers or change host security policy.
+
 Copy this prompt into Claude or Codex to update the guest components in an existing Windows or macOS VM.
 
 ```text

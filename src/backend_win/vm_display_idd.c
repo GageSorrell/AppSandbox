@@ -39,6 +39,10 @@
 #include "vm_display_idd.h"
 #include "asb_core.h"
 #include "../core/protocol.h"
+#include "../../tools/transport/asb_display_resize.h"
+#include "windowed_resolution.h"
+#include "fullscreen_resolution.h"
+#include <dbt.h>
 #include "../core/api_json.h"
 #include "../../tools/transport/asb_automation.h"
 #include "vm_clipboard.h"
@@ -224,6 +228,12 @@ struct VmDisplayIdd {
     volatile BOOL open;
     volatile BOOL stop;
     volatile LONG fullscreen;
+    BOOL fullscreen_pinned;
+    BOOL fullscreen_override;
+    UINT saved_fullscreen_width, saved_fullscreen_height;
+    UINT fullscreen_target_width, fullscreen_target_height;
+    HMONITOR fullscreen_monitor;
+    BOOL fullscreen_fitting;
     WINDOWPLACEMENT windowed_placement;
     LONG_PTR windowed_style;
 
@@ -259,6 +269,10 @@ struct VmDisplayIdd {
     BOOL                    shared_ready;
     BOOL                    shared_disabled;
     BOOL                    shared_resize;
+    BOOL                    windows_cpu_resize;
+    BOOL                    explicit_size_request;
+    BOOL                    windows_control_disabled;
+    AsbDisplayResizeState    windows_resize_state;
     BOOL                    shared_refresh;
     BOOL                    shared_screenshot;
     UINT                    shared_refresh_rate;
@@ -268,6 +282,9 @@ struct VmDisplayIdd {
     UINT                    display_height;
     UINT                    guest_size_mode;
     UINT                    size_mode;
+    UINT                    saved_windowed_width;
+    UINT                    saved_windowed_height;
+    BOOL                    windowed_unavailable_reported;
     DisplayGpuPacket        size_request;
     ULONGLONG               size_reconnect_until;
     BOOL                    size_follow_pending;
@@ -686,71 +703,30 @@ static void idd_flush_mouse_buttons(VmDisplayIdd *d)
     if (GetCapture() == d->render_hwnd) ReleaseCapture();
 }
 
-/* ==================================================================
- * Per-VM display settings (display_settings.json beside disk.vhdx)
- *
- * Mirrors the vm_state.json pattern in asb_core.c but is owned entirely
- * by the IDD display: the file is created lazily the first time a VM's
- * display opens, so both new and pre-existing VMs get one on demand.
- * ================================================================== */
-
-static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, size_t out_chars)
+/* All persistent preferences share the backend's atomic update path. */
+static void idd_display_settings_load(VmDisplayIdd *d)
 {
-    wchar_t dir[MAX_PATH];
-    const wchar_t *last_slash;
-    wcscpy_s(dir, MAX_PATH, vhdx_path);
-    last_slash = wcsrchr(dir, L'\\');
-    if (last_slash) dir[last_slash - dir] = L'\0';
-    swprintf_s(out, out_chars, L"%s\\display_settings.json", dir);
-}
-
-static BOOL idd_display_settings_save(VmDisplayIdd *d)
-{
-    wchar_t path[MAX_PATH];
-    wchar_t temporary[MAX_PATH];
-    FILE *f;
-    BOOL ok;
-    if (!d->vhdx_path[0]) return FALSE;
-    idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
-    if (swprintf_s(temporary, MAX_PATH, L"%s.tmp", path) < 0) return FALSE;
-    if (_wfopen_s(&f, temporary, L"w") != 0 || !f) return FALSE;
-    ok = fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"shareClipboard\":%d}\n",
-                 d->transmit_hotkeys ? 1 : 0, d->share_clipboard ? 1 : 0) > 0;
-    if (fclose(f) != 0) ok = FALSE;
-    if (ok && MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-        return TRUE;
-    DeleteFileW(temporary);
-    return FALSE;
-}
-
-static void idd_display_settings_load_or_create(VmDisplayIdd *d)
-{
-    wchar_t path[MAX_PATH];
-    FILE *f;
-    wchar_t buf[512];
-    size_t length;
-    int value;
-
+    AsbDisplaySettings settings;
+    HRESULT hr = asb_vm_get_display_settings((AsbVm)asb_find_vm_by_id(d->vm_id), &settings);
     d->transmit_hotkeys = FALSE;
     d->share_clipboard = TRUE;
-    if (!d->vhdx_path[0]) return;
-    idd_display_settings_path(d->vhdx_path, path, MAX_PATH);
-
-    if (_wfopen_s(&f, path, L"rt, ccs=UTF-8") != 0 || !f) {
-        idd_display_settings_save(d);
-        return;
-    }
-    length = fread(buf, sizeof(wchar_t), ARRAYSIZE(buf) - 1, f);
-    buf[length] = L'\0';
-    if (!ferror(f) && feof(f)) {
-        if (api_json_get_bool(buf, L"transmitKeyboardHotkeys", &value) ||
-            api_json_get_int(buf, L"transmitKeyboardHotkeys", &value))
-            d->transmit_hotkeys = value != 0;
-        if (api_json_get_bool(buf, L"shareClipboard", &value) ||
-            api_json_get_int(buf, L"shareClipboard", &value))
-            d->share_clipboard = value != 0;
-    }
-    fclose(f);
+    d->saved_windowed_width = 1920;
+    d->saved_windowed_height = 1080;
+    d->size_mode = DISPLAY_SIZE_GUEST; /* Match is never persisted. */
+    d->fullscreen_override = FALSE;
+    d->saved_fullscreen_width = d->fullscreen_target_width = 1920;
+    d->saved_fullscreen_height = d->fullscreen_target_height = 1080;
+    d->fullscreen_pinned = FALSE;
+    if (SUCCEEDED(hr)) {
+        d->transmit_hotkeys = settings.transmit_keyboard_hotkeys;
+        d->share_clipboard = settings.share_clipboard;
+        d->saved_windowed_width = settings.resolution.windowed_width;
+        d->saved_windowed_height = settings.resolution.windowed_height;
+        d->fullscreen_override = settings.resolution.fullscreen_override;
+        d->saved_fullscreen_width = settings.resolution.fullscreen_width;
+        d->saved_fullscreen_height = settings.resolution.fullscreen_height;
+        d->fullscreen_pinned = settings.fullscreen_pinned;
+    } else idd_log(d, L"Could not read viewer settings; using defaults.");
 }
 
 /* ==================================================================
@@ -1512,11 +1488,12 @@ static void idd_shared_release(VmDisplayIdd *d)
     d->shared_front = -1;
     d->shared_pending = -1;
     d->shared_ready = FALSE;
-    d->shared_resize = FALSE;
+    if (_wcsicmp(d->os_type, L"windows") != 0) d->shared_resize = FALSE;
     d->shared_refresh = FALSE;
     d->shared_screenshot = FALSE;
     d->shared_refresh_rate = 0;
-    ZeroMemory(&d->size_request, sizeof(d->size_request));
+    if (_wcsicmp(d->os_type, L"windows") != 0)
+        ZeroMemory(&d->size_request, sizeof(d->size_request));
     d->shared_next = 0;
     if (d->shared_context) ID3D11DeviceContext4_Release(d->shared_context);
     d->shared_context = NULL;
@@ -1603,6 +1580,7 @@ static HRESULT idd_shared_acquire(VmDisplayIdd *d, DWORD timeout)
                 d->frame_srv = NULL;
                 if (d->frame_tex) d->frame_tex->lpVtbl->Release(d->frame_tex);
                 d->frame_tex = NULL;
+                asb_resize_observe(&d->windows_resize_state, d->shared_width, d->shared_height, d->guest_size_mode);
                 d->frame_width = d->shared_width;
                 d->frame_height = d->shared_height;
                 d->frame_stride = d->frame_width * 4;
@@ -1829,20 +1807,74 @@ static BOOL idd_shared_import_linux(VmDisplayIdd *d, SOCKET socket,
     return sent && SUCCEEDED(hr);
 }
 
+/* frame_cs must be held. CPU control is separate from texture import. */
+static BOOL idd_resize_available(VmDisplayIdd *d)
+{
+    return (d->windows_cpu_resize && !d->windows_control_disabled && d->shared_session &&
+            d->frame_socket != INVALID_SOCKET) ||
+        (d->shared_ready && d->shared_resize && !d->shared_disabled &&
+         (d->shared_front >= 0 || d->shared_pending >= 0));
+}
+
 static BOOL idd_send_size_request(VmDisplayIdd *d, SOCKET s)
 {
     DisplayGpuPacket packet = {0};
     EnterCriticalSection(&d->frame_cs);
-    if (!d->input_sizing && d->shared_ready && d->shared_resize && !d->shared_disabled &&
-        d->frame_socket == s && d->size_request.type &&
-        (d->shared_front >= 0 || d->shared_pending >= 0)) {
+    if (!d->input_sizing && idd_resize_available(d) &&
+        d->frame_socket == s && d->size_request.type) {
         packet = d->size_request;
         packet.session = d->shared_session;
+        if (_wcsicmp(d->os_type, L"windows") == 0) {
+            int started = asb_resize_begin(&d->windows_resize_state, &packet, GetTickCount64());
+            if (started != 1) packet.type = 0;
+        }
         ZeroMemory(&d->size_request, sizeof(d->size_request));
-        d->size_reconnect_until = GetTickCount64() + 10000;
+        d->explicit_size_request = FALSE;
+        if (packet.type) d->size_reconnect_until = GetTickCount64() + 10000;
     }
     LeaveCriticalSection(&d->frame_cs);
-    return !packet.type || idd_send_gpu(s, &packet);
+    BOOL sent = !packet.type || idd_send_gpu(s, &packet);
+    if (!sent && _wcsicmp(d->os_type, L"windows") == 0) {
+        EnterCriticalSection(&d->frame_cs);
+        asb_resize_fail(&d->windows_resize_state, (UINT32)HRESULT_FROM_WIN32(ERROR_CONNECTION_ABORTED));
+        d->size_reconnect_until = 0;
+        LeaveCriticalSection(&d->frame_cs);
+        idd_log(d, L"Display resize could not be sent; keeping the last working display.");
+    }
+    return sent;
+}
+
+HRESULT vm_display_idd_request_resolution(VmDisplayIdd *d, UINT width, UINT height)
+{
+    if (!d || !asb_windows_display_dimensions(width, height)) return E_INVALIDARG;
+    if (_wcsicmp(d->os_type, L"windows") != 0) return E_NOTIMPL;
+    HRESULT result = S_OK;
+    EnterCriticalSection(&d->frame_cs);
+    if (!idd_resize_available(d)) result = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    else if (!d->windows_cpu_resize)
+        result = HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH);
+    else {
+        DisplayGpuPacket packet = {0};
+        packet.magic = DISPLAY_GPU_MAGIC;
+        packet.version = DISPLAY_GPU_VERSION;
+        packet.type = DISPLAY_GPU_RESIZE;
+        packet.session = d->shared_session;
+        packet.width = width;
+        packet.height = height;
+        packet.slot = DISPLAY_SIZE_GUEST;
+        if (d->windows_resize_state.failed.type && asb_resize_same(&packet, &d->windows_resize_state.failed))
+            result = (HRESULT)d->windows_resize_state.failure;
+        else if (d->windows_resize_state.pending.type || d->size_request.type)
+            result = HRESULT_FROM_WIN32(ERROR_BUSY);
+        else {
+            d->size_request = packet;
+            d->explicit_size_request = TRUE;
+            d->size_mode = DISPLAY_SIZE_GUEST;
+        }
+    }
+    LeaveCriticalSection(&d->frame_cs);
+    if (FAILED(result)) idd_log(d, L"Display resize unavailable (0x%08X); keeping the last working mode. CPU resize and smaller modes require the updated guest VDD.", result);
+    return result;
 }
 
 static UINT idd_monitor_refresh(HWND hwnd)
@@ -1859,17 +1891,110 @@ static UINT idd_monitor_refresh(HWND hwnd)
     return refresh >= DISPLAY_MIN_REFRESH ? min(refresh, DISPLAY_MAX_REFRESH) : 60;
 }
 
+/* Guest pixels are physical client pixels; only the nonclient frame scales. */
+static void idd_size_window_content(VmDisplayIdd *d, UINT width, UINT height)
+{
+    RECT rc = {0, 0, (LONG)width, (LONG)height};
+    if (!AdjustWindowRectExForDpi(&rc, (DWORD)GetWindowLongW(d->hwnd, GWL_STYLE),
+        FALSE, (DWORD)GetWindowLongW(d->hwnd, GWL_EXSTYLE), GetDpiForWindow(d->hwnd))) {
+        idd_log(d, L"Could not size viewer content (0x%08X).", GetLastError());
+        return;
+    }
+    if (IsZoomed(d->hwnd)) ShowWindow(d->hwnd, SW_RESTORE);
+    if (!SetWindowPos(d->hwnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE))
+        idd_log(d, L"Could not size viewer content (0x%08X).", GetLastError());
+}
+
+static void idd_update_windowed_resolution(VmDisplayIdd *d)
+{
+    RECT client;
+    DisplayGpuPacket target;
+    /* Evaluate on the timer too: CAPS may arrive well after viewer creation. */
+    if (d->fullscreen || d->input_sizing || IsIconic(d->hwnd)) return;
+    if (!TryEnterCriticalSection(&d->frame_cs)) return;
+    GetClientRect(d->hwnd, &client);
+    target = asb_windowed_target(d->saved_windowed_width, d->saved_windowed_height,
+        d->size_mode, (UINT)client.right, (UINT)client.bottom);
+    if (d->shared_offered && !d->windows_cpu_resize && !d->windowed_unavailable_reported) {
+        d->windowed_unavailable_reported = TRUE;
+        idd_log(d, L"Saved windowed resolution could not be applied; update the guest VDD. Keeping the working frame and saved preference.");
+    }
+    if (idd_resize_available(d) && d->windows_cpu_resize &&
+        asb_windowed_needs_request(&target, d->shared_width, d->shared_height,
+            d->guest_size_mode, &d->size_request, &d->windows_resize_state)) {
+        target.session = d->shared_session;
+        d->size_request = target;
+        d->explicit_size_request = TRUE;
+    }
+    LeaveCriticalSection(&d->frame_cs);
+}
+
+static void idd_update_fullscreen_resolution(VmDisplayIdd *d)
+{
+    DisplayGpuPacket target;
+    if (!d->fullscreen || d->input_sizing || IsIconic(d->hwnd)) return;
+    if (!TryEnterCriticalSection(&d->frame_cs)) return;
+    target = asb_windowed_target(d->fullscreen_target_width, d->fullscreen_target_height,
+        DISPLAY_SIZE_GUEST, 0, 0);
+    if (d->shared_offered && !d->windows_cpu_resize && !d->windowed_unavailable_reported) {
+        d->windowed_unavailable_reported = TRUE;
+        idd_log(d, L"Fullscreen resolution could not be applied; update the guest VDD. Keeping the working frame and saved preference.");
+    }
+    if (idd_resize_available(d) && d->windows_cpu_resize &&
+        asb_windowed_needs_request(&target, d->shared_width, d->shared_height,
+            d->guest_size_mode, &d->size_request, &d->windows_resize_state)) {
+        target.session = d->shared_session;
+        d->size_request = target;
+        d->explicit_size_request = TRUE;
+    }
+    LeaveCriticalSection(&d->frame_cs);
+}
+
+static BOOL idd_windowed_match_available(VmDisplayIdd *d)
+{
+    /* An active session override can always be turned off after a disconnect. */
+    return !d->fullscreen && (d->size_mode == DISPLAY_SIZE_WINDOW ||
+        (idd_resize_available(d) && d->windows_cpu_resize));
+}
+
+static void idd_toggle_windowed_match(VmDisplayIdd *d)
+{
+    BOOL fixed;
+    EnterCriticalSection(&d->frame_cs);
+    if (!idd_windowed_match_available(d)) {
+        LeaveCriticalSection(&d->frame_cs);
+        return;
+    }
+    fixed = d->size_mode == DISPLAY_SIZE_WINDOW;
+    d->size_mode = fixed ? DISPLAY_SIZE_GUEST : DISPLAY_SIZE_WINDOW;
+    /* Supersede an unsent target; an in-flight target must finish or time out. */
+    ZeroMemory(&d->size_request, sizeof(d->size_request));
+    d->explicit_size_request = FALSE;
+    LeaveCriticalSection(&d->frame_cs);
+    if (fixed) idd_size_window_content(d, d->saved_windowed_width, d->saved_windowed_height);
+    idd_update_windowed_resolution(d);
+}
+
 static void idd_update_display_size(VmDisplayIdd *d, BOOL follow)
 {
     RECT rc;
     UINT width, height, mode, refresh;
     BOOL active, resize_window = FALSE;
     if (!d || !d->hwnd) return;
+    if (_wcsicmp(d->os_type, L"windows") == 0) {
+        if (d->fullscreen) idd_update_fullscreen_resolution(d);
+        else idd_update_windowed_resolution(d);
+        return;
+    }
     d->size_update_pending = TRUE;
     if (follow) d->size_follow_pending = TRUE;
     if (!TryEnterCriticalSection(&d->frame_cs)) return;
-    active = d->shared_ready && d->shared_resize && !d->shared_disabled &&
-        (d->shared_front >= 0 || d->shared_pending >= 0);
+    active = idd_resize_available(d);
+    if (d->explicit_size_request) {
+        LeaveCriticalSection(&d->frame_cs);
+        return;
+    }
     mode = d->size_mode;
     if ((mode == DISPLAY_SIZE_WINDOW && !active) ||
         d->input_sizing || IsIconic(d->hwnd)) {
@@ -1882,10 +2007,12 @@ static void idd_update_display_size(VmDisplayIdd *d, BOOL follow)
     height = d->frame_height;
     refresh = 60;
     if (mode == DISPLAY_SIZE_WINDOW) {
-        if (d->shared_refresh) refresh = idd_monitor_refresh(d->hwnd);
+        if (d->shared_refresh && (_wcsicmp(d->os_type, L"windows") != 0 || d->shared_ready))
+            refresh = idd_monitor_refresh(d->hwnd);
         GetClientRect(d->hwnd, &rc);
-        width = max(DISPLAY_MIN_WIDTH, min(DISPLAY_MAX_WIDTH, (UINT)rc.right));
-        height = max(DISPLAY_MIN_HEIGHT, min(DISPLAY_MAX_HEIGHT, (UINT)rc.bottom));
+        BOOL windows = _wcsicmp(d->os_type, L"windows") == 0;
+        width = max(windows && d->windows_cpu_resize ? ASB_WINDOWS_MIN_WIDTH : DISPLAY_MIN_WIDTH, min(DISPLAY_MAX_WIDTH, (UINT)rc.right));
+        height = max(windows && d->windows_cpu_resize ? ASB_WINDOWS_MIN_HEIGHT : DISPLAY_MIN_HEIGHT, min(DISPLAY_MAX_HEIGHT, (UINT)rc.bottom));
         resize_window = width != (UINT)rc.right || height != (UINT)rc.bottom;
     } else if (d->size_follow_pending) {
         resize_window = TRUE;
@@ -2792,8 +2919,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         d->shared_offered = FALSE;
         d->shared_rejected = FALSE;
         d->shared_session = 0;
+        d->windows_cpu_resize = FALSE;
+        d->shared_resize = FALSE;
         LeaveCriticalSection(&d->frame_cs);
-        if (vm && vm->gpu_mode == GPU_DEFAULT && !d->shared_disabled) {
+        if (vm && ((_wcsicmp(d->os_type, L"windows") == 0 && !d->windows_control_disabled) ||
+            (_wcsicmp(d->os_type, L"windows") != 0 && vm->gpu_mode == GPU_DEFAULT && !d->shared_disabled))) {
             static volatile LONG gpu_session_id;
             DisplayGpuPacket query = {0};
             DWORD send_timeout = 1000;
@@ -2802,6 +2932,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             query.version = DISPLAY_GPU_VERSION;
             query.reserved = _wcsicmp(d->os_type, L"windows") == 0
                 ? DISPLAY_GPU_CAP_RESIZE : DISPLAY_GPU_CAP_FENCE | DISPLAY_GPU_CAP_RESIZE;
+            if (_wcsicmp(d->os_type, L"windows") == 0) query.reserved |= DISPLAY_GPU_CAP_CPU_RESIZE;
             query.reserved |= DISPLAY_GPU_CAP_REFRESH;
             query.reserved |= DISPLAY_GPU_CAP_SNAPSHOT;
             query.session = ((UINT64)GetCurrentProcessId() << 32) |
@@ -2825,7 +2956,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             BOOL resolution_changed = FALSE;
 
             /* Peek at magic to determine message type */
-            if (!recv_exact(d, s, &magic, sizeof(magic), d->shared_ready))
+            if (!recv_exact(d, s, &magic, sizeof(magic), d->shared_ready || d->windows_cpu_resize))
                 break;
 
             if (magic == DISPLAY_GPU_MAGIC) {
@@ -2835,6 +2966,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     break;
                 if (packet.version != DISPLAY_GPU_VERSION) {
                     d->shared_disabled = TRUE;
+                    if (_wcsicmp(d->os_type, L"windows") == 0) {
+                        d->windows_control_disabled = TRUE;
+                        idd_log(d, L"Guest display protocol is incompatible; update the guest VDD. Using CPU frames without resize.");
+                    }
                     break;
                 }
                 if (!d->shared_session || packet.session != d->shared_session) break;
@@ -2849,6 +2984,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     }
                     EnterCriticalSection(&d->frame_cs);
                     d->shared_resize = (packet.reserved & DISPLAY_GPU_CAP_RESIZE) != 0;
+                    d->windows_cpu_resize = _wcsicmp(d->os_type, L"windows") == 0 &&
+                        asb_windows_cpu_resize_capability(packet.version, packet.reserved);
                     d->shared_refresh = (packet.reserved & DISPLAY_GPU_CAP_REFRESH) != 0;
                     d->shared_screenshot = (packet.reserved & DISPLAY_GPU_CAP_SNAPSHOT) != 0;
                     d->shared_refresh_rate = d->shared_refresh ? (UINT)packet.handle : 60;
@@ -2856,6 +2993,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->shared_height = packet.height;
                     d->guest_size_mode = packet.slot;
                     LeaveCriticalSection(&d->frame_cs);
+                    if (_wcsicmp(d->os_type, L"windows") == 0 &&
+                        (d->shared_disabled || !vm || vm->gpu_mode != GPU_DEFAULT)) continue;
                     for (slot = 0; slot < DISPLAY_GPU_SLOTS; ++slot) {
                         if (!idd_shared_offer(d, s, &packet, slot)) break;
                     }
@@ -2901,9 +3040,16 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     packet.status = status;
                     if (!idd_send_gpu(s, &packet)) break;
                 } else if (packet.type == DISPLAY_GPU_RESIZED) {
+                    if (_wcsicmp(d->os_type, L"windows") == 0) {
+                        EnterCriticalSection(&d->frame_cs);
+                        BOOL matched = asb_resize_reply(&d->windows_resize_state, &packet);
+                        if (matched && packet.status == S_OK) d->guest_size_mode = packet.slot;
+                        LeaveCriticalSection(&d->frame_cs);
+                        if (!matched) continue;
+                    }
                     if (packet.status != S_OK) {
                         d->size_reconnect_until = 0;
-                        idd_log(d, L"Display resize rejected (0x%08X).", packet.status);
+                        idd_log(d, L"Display resize rejected (0x%08X); keeping the last working display. The guest VDD may need updating.", packet.status);
                         if (broker) PostMessageW(d->hwnd, WM_IDD_DISPLAY_SIZE, TRUE, packet.status);
                     } else if (broker && packet.slot <= DISPLAY_SIZE_WINDOW) {
                         EnterCriticalSection(&d->frame_cs);
@@ -3097,6 +3243,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 }
             }
 
+            if (d->windows_cpu_resize) {
+                d->shared_width = d->frame_width;
+                d->shared_height = d->frame_height;
+                asb_resize_observe(&d->windows_resize_state, d->frame_width, d->frame_height, d->guest_size_mode);
+            }
             d->frame_dirty = TRUE;
             if (d->display_width != d->frame_width || d->display_height != d->frame_height) {
                 d->display_width = d->frame_width;
@@ -3121,9 +3272,19 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         /* Frame channel lost — close it but keep input alive */
         EnterCriticalSection(&d->frame_cs);
-        if (d->shared_ready && !d->shared_disabled)
+        if (d->explicit_size_request && d->size_request.type && !d->windows_resize_state.pending.type) {
+            d->size_request.session = d->shared_session;
+            if (asb_resize_begin(&d->windows_resize_state, &d->size_request, GetTickCount64()) == 1)
+                asb_resize_fail(&d->windows_resize_state, (UINT32)HRESULT_FROM_WIN32(ERROR_CONNECTION_ABORTED));
+            ZeroMemory(&d->size_request, sizeof(d->size_request));
+            d->explicit_size_request = FALSE;
+            idd_log(d, L"Display disconnected before resize could be sent; keeping the last working mode.");
+        }
+        if (_wcsicmp(d->os_type, L"windows") != 0 && d->shared_ready && !d->shared_disabled)
             d->size_reconnect_until = GetTickCount64() + 10000;
         d->frame_socket = INVALID_SOCKET;
+        d->windows_cpu_resize = FALSE;
+        d->shared_resize = FALSE;
         idd_shared_release(d);
         LeaveCriticalSection(&d->frame_cs);
         asb_gpu_broker_close(broker);
@@ -3168,12 +3329,19 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
 
-    /* Compute outer window size so the client area is exactly 1920x1080 */
+    /* Correct the Windows client size using the created window's actual DPI. */
     {
         DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
         DWORD exstyle = 0;
+        BOOL windows = _wcsicmp(d->os_type, L"windows") == 0;
         RECT wr = { 0, 0, 1920, 1080 };
-        AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+        if (windows) {
+            style &= ~WS_VISIBLE;
+            wr.right = (LONG)d->saved_windowed_width;
+            wr.bottom = (LONG)d->saved_windowed_height;
+        }
+        if (windows) AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, GetDpiForSystem());
+        else AdjustWindowRectEx(&wr, style, FALSE, exstyle);
 
         d->hwnd = CreateWindowExW(
             exstyle, IDD_DISPLAY_CLASS, title, style,
@@ -3187,6 +3355,10 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         d->open = FALSE;
         if (SUCCEEDED(apartment)) CoUninitialize();
         return 1;
+    }
+    if (_wcsicmp(d->os_type, L"windows") == 0) {
+        idd_size_window_content(d, d->saved_windowed_width, d->saved_windowed_height);
+        ShowWindow(d->hwnd, SW_SHOW);
     }
 
     /* Dark mode title bar to match AppSandbox main window */
@@ -3288,6 +3460,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     if (SUCCEEDED(apartment))
         d->agent_overlay = agent_overlay_create(d->render_hwnd,d->hwnd,WM_IDD_TAKE_CONTROL,WM_IDD_FULLSCREEN,WM_IDD_VIEWER_OPTIONS,d->vm_id);
 
+    agent_overlay_set_pinned(d->agent_overlay,d->fullscreen_pinned);
+
     /* Start the recv thread now that the window and D3D11 are ready */
     d->shared_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
     d->shared_fence_event = CreateEventW(NULL, FALSE, FALSE, NULL);
@@ -3346,13 +3520,59 @@ static void idd_join_thread(HANDLE thread)
     }
 }
 
+static void idd_select_fullscreen_resolution(VmDisplayIdd *d, HMONITOR target)
+{
+    UINT width = d->saved_fullscreen_width, height = d->saved_fullscreen_height;
+    if (!d->fullscreen_override) {
+        AsbDisplayCapabilities caps = {0};
+        AsbDisplayMode maximum = {0};
+        HRESULT hr = asb_get_host_display_capabilities(&caps);
+        if (SUCCEEDED(hr)) hr = asb_get_host_monitor_maximum(&caps, target, &maximum);
+        asb_free_host_display_capabilities(&caps);
+        if (SUCCEEDED(hr)) {
+            width = (UINT)maximum.width;
+            height = (UINT)maximum.height;
+        } else {
+            MONITORINFO current = {sizeof(current)};
+            DisplayGpuPacket fallback = asb_fullscreen_fallback(0, 0);
+            if (GetMonitorInfoW(target, &current))
+                fallback = asb_fullscreen_fallback(
+                    (int64_t)current.rcMonitor.right - current.rcMonitor.left,
+                    (int64_t)current.rcMonitor.bottom - current.rcMonitor.top);
+            width = fallback.width;
+            height = fallback.height;
+            idd_log(d, L"Automatic fullscreen resolution detection failed (0x%08X); using %ux%u. Saved preferences are unchanged.",
+                hr, width, height);
+        }
+    }
+    EnterCriticalSection(&d->frame_cs);
+    if (width != d->fullscreen_target_width || height != d->fullscreen_target_height) {
+        /* Supersede queued requests, but allow an in-flight mode to settle. */
+        ZeroMemory(&d->size_request, sizeof(d->size_request));
+        d->explicit_size_request = FALSE;
+    }
+    d->fullscreen_target_width = width;
+    d->fullscreen_target_height = height;
+    LeaveCriticalSection(&d->frame_cs);
+}
+
 static BOOL idd_fit_fullscreen(VmDisplayIdd *d,HMONITOR target)
 {
     MONITORINFO monitor={sizeof(monitor)};
+    BOOL result;
+    /* SetWindowPos synchronously generates move/size/DPI messages. */
+    if (d->fullscreen_fitting) return TRUE;
     if (!GetMonitorInfoW(target,&monitor)) return FALSE;
-    return SetWindowPos(d->hwnd,NULL,monitor.rcMonitor.left,monitor.rcMonitor.top,
+    d->fullscreen_fitting = TRUE;
+    if (_wcsicmp(d->os_type,L"windows") == 0) idd_select_fullscreen_resolution(d,target);
+    d->fullscreen_monitor = target;
+    result = SetWindowPos(d->hwnd,NULL,monitor.rcMonitor.left,monitor.rcMonitor.top,
         monitor.rcMonitor.right-monitor.rcMonitor.left,monitor.rcMonitor.bottom-monitor.rcMonitor.top,
         SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);
+    d->fullscreen_fitting = FALSE;
+    if (!result) idd_log(d,L"Could not fit fullscreen viewer to the target monitor (0x%08X).",GetLastError());
+    if (_wcsicmp(d->os_type,L"windows") == 0) idd_update_fullscreen_resolution(d);
+    return result;
 }
 
 static BOOL idd_set_fullscreen(VmDisplayIdd *d,BOOL enabled)
@@ -3363,6 +3583,12 @@ static BOOL idd_set_fullscreen(VmDisplayIdd *d,BOOL enabled)
         d->windowed_placement.length=sizeof(d->windowed_placement);
         if (!GetWindowPlacement(d->hwnd,&d->windowed_placement)) return FALSE;
         d->windowed_style=GetWindowLongPtrW(d->hwnd,GWL_STYLE);
+    }
+    if (_wcsicmp(d->os_type,L"windows") == 0) {
+        EnterCriticalSection(&d->frame_cs);
+        ZeroMemory(&d->size_request,sizeof(d->size_request));
+        d->explicit_size_request=FALSE;
+        LeaveCriticalSection(&d->frame_cs);
     }
     d->input_sizing=TRUE;
     idd_update_relative_mouse(d);
@@ -3390,10 +3616,11 @@ static BOOL idd_set_fullscreen(VmDisplayIdd *d,BOOL enabled)
 
 static void idd_viewer_option_state(VmDisplayIdd *d,UINT *enabled,UINT *checked)
 {
-    *enabled=28;*checked=0;
+    *enabled=28 | (1u<<AGENT_VIEWER_OPTION_PIN);*checked=0;
+    if (d->fullscreen_pinned) *checked|=1u<<AGENT_VIEWER_OPTION_PIN;
     if (asb_vm_sas_supported((AsbVm)asb_find_vm_by_id(d->vm_id))) *enabled|=1;
-    if (d->shared_ready && d->shared_resize && !d->shared_disabled &&
-        (d->shared_front>=0 || d->shared_pending>=0)) *enabled|=2;
+    if (_wcsicmp(d->os_type,L"windows") == 0 ? idd_windowed_match_available(d) :
+        idd_resize_available(d)) *enabled|=2;
     if (d->size_mode==DISPLAY_SIZE_WINDOW) *checked|=2;
     if (d->share_clipboard) *checked|=4;
     if (d->transmit_hotkeys) *checked|=8;
@@ -3425,6 +3652,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_IDD_VIEWER_OPTIONS:
         if (d && d->fullscreen) {
             UINT enabled=0,checked=0;
+            if (wp==AGENT_VIEWER_OPTION_PIN) {
+                BOOL pinned=!d->fullscreen_pinned;
+                HRESULT hr=asb_vm_set_fullscreen_pinned((AsbVm)asb_find_vm_by_id(d->vm_id),pinned);
+                if (SUCCEEDED(hr)) {
+                    d->fullscreen_pinned=pinned;
+                    agent_overlay_set_pinned(d->agent_overlay,pinned);
+                } else idd_log(d,L"Could not save fullscreen control pinning.");
+            }
             idd_viewer_option_state(d,&enabled,&checked);
             if (wp<ARRAYSIZE(g_viewer_commands) && (enabled&(1u<<wp))) {
                 SendMessageW(hwnd,WM_SYSCOMMAND,g_viewer_commands[wp],0);
@@ -3485,15 +3720,18 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             CheckMenuItem(sysmenu, IDM_SHARE_CLIPBOARD,
                           MF_BYCOMMAND | (d->share_clipboard ? MF_CHECKED : MF_UNCHECKED));
             SendMessageW(hwnd, WM_IDD_CLIPBOARD_READY, 0, 0);
-            if (!idd_display_settings_save(d))
+            if (FAILED(asb_vm_set_display_clipboard((AsbVm)asb_find_vm_by_id(d->vm_id), d->share_clipboard)))
                 idd_log(d, L"Could not save viewer settings.");
             idd_log(d, d->share_clipboard ? L"Clipboard sharing: ON." : L"Clipboard sharing: OFF.");
             return 0;
         }
         if (d && (wp & 0xFFF0) == IDM_MATCH_WINDOW) {
             BOOL enabled;
-            enabled = d->shared_ready && d->shared_resize && !d->shared_disabled &&
-                (d->shared_front >= 0 || d->shared_pending >= 0);
+            if (_wcsicmp(d->os_type,L"windows") == 0) {
+                idd_toggle_windowed_match(d);
+                return 0;
+            }
+            enabled = idd_resize_available(d);
             if (enabled) {
                 d->size_mode = d->size_mode == DISPLAY_SIZE_WINDOW ? DISPLAY_SIZE_GUEST : DISPLAY_SIZE_WINDOW;
             }
@@ -3528,7 +3766,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 idd_flush_held_keys(d);
             }
             idd_update_kbd_hook(d);
-            if (!idd_display_settings_save(d))
+            if (FAILED(asb_vm_set_display_hotkeys((AsbVm)asb_find_vm_by_id(d->vm_id), d->transmit_hotkeys)))
                 idd_log(d, L"Could not save viewer settings.");
             idd_log(d, d->transmit_hotkeys
                         ? L"Transmit Keyboard Hotkeys: ON."
@@ -3652,18 +3890,19 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL match_window = FALSE;
         if (d) {
             match_window = d->size_mode == DISPLAY_SIZE_WINDOW &&
-                d->shared_ready && d->shared_resize && !d->shared_disabled;
+                idd_resize_available(d);
         }
         wr.left = 0; wr.top = 0;
-        wr.right = match_window ? DISPLAY_MIN_WIDTH : 320;
-        wr.bottom = match_window ? DISPLAY_MIN_HEIGHT : 180;
+        wr.right = match_window ? (d->windows_cpu_resize ? ASB_WINDOWS_MIN_WIDTH : DISPLAY_MIN_WIDTH) : 320;
+        wr.bottom = match_window ? (d->windows_cpu_resize ? ASB_WINDOWS_MIN_HEIGHT : DISPLAY_MIN_HEIGHT) : 180;
         AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, GetDpiForWindow(hwnd));
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
         if (d && d->frame_width > 0 && d->frame_height > 0) {
             wr.left = 0; wr.top = 0;
-            wr.right = (LONG)(match_window ? DISPLAY_MAX_WIDTH : d->frame_width);
-            wr.bottom = (LONG)(match_window ? DISPLAY_MAX_HEIGHT : d->frame_height);
+            BOOL windows = _wcsicmp(d->os_type,L"windows") == 0;
+            wr.right = (LONG)(match_window || windows ? DISPLAY_MAX_WIDTH : d->frame_width);
+            wr.bottom = (LONG)(match_window || windows ? DISPLAY_MAX_HEIGHT : d->frame_height);
             AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, GetDpiForWindow(hwnd));
             mmi->ptMaxTrackSize.x = wr.right - wr.left;
             mmi->ptMaxTrackSize.y = wr.bottom - wr.top;
@@ -3695,11 +3934,28 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             agent_overlay_resize(d->agent_overlay);
             return 0;
         }
+        if (d && _wcsicmp(d->os_type,L"windows") == 0) {
+            RECT *suggested = (RECT *)lp;
+            BOOL sizing = d->input_sizing;
+            /* Honor the DPI transition while keeping the fixed guest target. */
+            d->input_sizing = TRUE;
+            SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
+                suggested->right - suggested->left, suggested->bottom - suggested->top,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            d->input_sizing = sizing;
+            idd_update_display_size(d, FALSE);
+            return 0;
+        }
         break;
 
     case WM_DISPLAYCHANGE:
         if (d && d->fullscreen) idd_fit_fullscreen(d,MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST));
     case WM_MOVE:
+        if (d && d->fullscreen && !d->fullscreen_fitting && !d->input_sizing &&
+            _wcsicmp(d->os_type,L"windows") == 0) {
+            HMONITOR target = MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST);
+            if (target != d->fullscreen_monitor) idd_fit_fullscreen(d,target);
+        }
         if (d) agent_overlay_resize(d->agent_overlay);
         if (d && d->size_mode == DISPLAY_SIZE_WINDOW && !d->input_sizing)
             idd_update_display_size(d, FALSE);
@@ -3709,6 +3965,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ReleaseSRWLockExclusive(&g_mouse_capture_lock);
             idd_update_relative_mouse(d);
         }
+        break;
+
+    case WM_DEVICECHANGE:
+        if (d && d->fullscreen && wp == DBT_DEVNODES_CHANGED &&
+            _wcsicmp(d->os_type,L"windows") == 0)
+            idd_fit_fullscreen(d,MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST));
         break;
 
     case WM_ENTERSIZEMOVE:
@@ -3722,11 +3984,17 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             } else if (!d->input_sizing &&
                 (d->size_mode == DISPLAY_SIZE_WINDOW || d->size_follow_pending))
                 idd_update_display_size(d, FALSE);
+            if (!d->input_sizing && d->fullscreen && _wcsicmp(d->os_type,L"windows") == 0)
+                idd_fit_fullscreen(d,MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST));
             idd_update_relative_mouse(d);
         }
         break;
 
     case WM_IDD_DISPLAY_SIZE:
+        if (d && _wcsicmp(d->os_type,L"windows") == 0) {
+            idd_update_display_size(d,FALSE);
+            return 0;
+        }
         if (d && lp) d->size_mode = DISPLAY_SIZE_GUEST;
         if (d && (wp || d->shared_refresh || d->size_mode == DISPLAY_SIZE_WINDOW || d->guest_size_mode != DISPLAY_SIZE_GUEST))
             idd_update_display_size(d, wp != 0);
@@ -3743,7 +4011,13 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_TIMER:
         if (wp == IDT_PRESENT && d) {
-            if (d->size_update_pending && !d->input_sizing && !IsIconic(hwnd))
+            EnterCriticalSection(&d->frame_cs);
+            BOOL expired = asb_resize_expire(&d->windows_resize_state, GetTickCount64(), (UINT32)HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+            if (expired) d->size_reconnect_until = 0;
+            LeaveCriticalSection(&d->frame_cs);
+            if (expired) idd_log(d, L"Guest display resize timed out; keeping the last working display and blocking retries for that target.");
+            if ((_wcsicmp(d->os_type,L"windows") == 0 || d->size_update_pending) &&
+                !d->input_sizing && !IsIconic(hwnd))
                 idd_update_display_size(d, FALSE);
             idd_poll_mouse_position(d);
             {
@@ -4065,7 +4339,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->agent_control = d->agent_x = d->agent_y = -1;
     d->agent_finished = TRUE;
 
-    idd_display_settings_load_or_create(d);
+    idd_display_settings_load(d);
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;

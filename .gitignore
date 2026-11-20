@@ -456,6 +456,9 @@ src/app_mac/xcconfig/LocalUser.xcconfig
 !/vendor/qemu-ivshmem/dist/bin/*
 mac-gpu/
 
+# Runtime resources are supplied by upstream packaged releases.
+/resources/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

@@ -18,8 +18,11 @@
 #include "vm_display_idd.h"
 #include "vm_agent.h"
 #include "webview2_bridge.h"
+#include "display_capabilities_json.h"
+#include "display_resolution_command.h"
 #include "prereq.h"
 #include <dwmapi.h>
+#include <dbt.h>
 #include <commdlg.h>
 #include <commctrl.h>
 #include <stdio.h>
@@ -330,6 +333,22 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_string(jb, L"osName", asb_api_guest_os_name(v->os_type));
     asb_vm_disk_directory(asb_vm_get(i), disk_directory, MAX_PATH);
     jb_string(jb, L"diskDirectory", disk_directory);
+    if (!_wcsicmp(v->os_type, L"Windows")) {
+        AsbDisplaySettings settings;
+        HRESULT hr = asb_vm_get_display_settings(asb_vm_get(i), &settings);
+        jb_int(jb, L"displaySettingsError", hr);
+        if (SUCCEEDED(hr)) {
+            jb_append(jb, L",\"displayResolution\":");
+            jb_object_begin(jb);
+            jb_int(jb, L"windowedWidth", settings.resolution.windowed_width);
+            jb_int(jb, L"windowedHeight", settings.resolution.windowed_height);
+            jb_bool(jb, L"fullscreenOverride", settings.resolution.fullscreen_override);
+            jb_int(jb, L"fullscreenWidth", settings.resolution.fullscreen_width);
+            jb_int(jb, L"fullscreenHeight", settings.resolution.fullscreen_height);
+            jb_object_end(jb);
+            jb->count = 1;
+        }
+    }
     jb_bool(jb, L"running", v->running);
     jb_bool(jb, L"starting", v->starting);
     jb_bool(jb, L"shuttingDown", v->shutdown_requested);
@@ -1104,6 +1123,24 @@ static BOOL json_vm_index(const wchar_t *json, int *idx)
     return *idx >= 0;
 }
 
+static void send_display_capabilities(void)
+{
+    AsbDisplayCapabilities caps;
+    wchar_t *json = NULL;
+    asb_get_host_display_capabilities(&caps);
+    HRESULT hr = display_capabilities_json(&caps, &json);
+    asb_free_host_display_capabilities(&caps);
+    if (SUCCEEDED(hr)) {
+        webview2_post(json);
+        free(json);
+    } else {
+        wchar_t failure[192];
+        swprintf_s(failure, ARRAYSIZE(failure),
+            L"{\"type\":\"displayCapabilities\",\"ok\":false,\"errorCode\":%ld,\"monitors\":[],\"presets\":[]}", hr);
+        webview2_post(failure);
+    }
+}
+
 static void handle_webview2_message(const wchar_t *json)
 {
     wchar_t action[64] = { 0 };
@@ -1124,6 +1161,10 @@ static void handle_webview2_message(const wchar_t *json)
         if (!asb_api_start(g_hInstance, g_hwnd_main))
             ui_show_alert(L"The local API could not start. See headless.log for details.");
         send_full_state();
+    } else if (wcscmp(action, L"getDisplaySettings") == 0) {
+        send_vm_list();
+    } else if (wcscmp(action, L"getDisplayCapabilities") == 0) {
+        send_display_capabilities();
     } else if (wcscmp(action, L"createVm") == 0) {
         if (!g_prereq_ok) {
             webview2_post(g_prereq_reboot_pending
@@ -1342,6 +1383,18 @@ static void handle_webview2_message(const wchar_t *json)
             }
             send_templates();
         }
+    } else if (wcscmp(action, L"setDisplayResolution") == 0) {
+        int idx;
+        AsbDisplayResolution value, expected;
+        HRESULT hr = E_INVALIDARG;
+        if (json_vm_index(json, &idx) &&
+            SUCCEEDED(parse_display_resolution_command(json, &value, &expected)))
+            hr = asb_vm_set_display_resolution_if_unchanged(asb_vm_get(idx), &value, &expected);
+        if (hr == HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH))
+            ui_show_alert(L"Display settings changed in another interface. Reopen the editor to review the latest values.");
+        else if (FAILED(hr))
+            ui_show_alert(L"Display settings could not be saved. Use whole-number dimensions from 640x480 through 7680x4320 while the VM is stopped.");
+        send_vm_list();
     } else if (wcscmp(action, L"editVm") == 0) {
         int idx;
         wchar_t field[64], value[256];
@@ -1597,6 +1650,15 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         L"App Sandbox", MB_ICONERROR);
         }
         tray_add(hwnd);
+        return 0;
+
+    case WM_DEVICECHANGE:
+        if (wp != DBT_DEVNODES_CHANGED) break;
+        if (webview2_is_ready()) send_display_capabilities();
+        return 0;
+
+    case WM_DISPLAYCHANGE:
+        if (webview2_is_ready()) send_display_capabilities();
         return 0;
 
     case WM_SIZE:

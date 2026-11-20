@@ -3,8 +3,12 @@
 
 typedef struct AgentOverlay AgentOverlay;
 
+/* Wire IDs 0..4 retain their existing viewer command meanings. */
+enum { AGENT_VIEWER_OPTION_PIN = 5, AGENT_VIEWER_OPTIONS_QUERY = 6 };
+
 AgentOverlay *agent_overlay_create(HWND render, HWND notify, UINT take_control_message, UINT fullscreen_message, UINT options_message, UINT64 vm_id);
 void agent_overlay_viewer_options(AgentOverlay *overlay, UINT enabled, UINT checked);
+void agent_overlay_set_pinned(AgentOverlay *overlay, BOOL pinned);
 void agent_overlay_set_fullscreen(AgentOverlay *overlay, BOOL enabled);
 BOOL agent_overlay_is_ready(AgentOverlay *overlay);
 void agent_overlay_destroy(AgentOverlay *overlay);

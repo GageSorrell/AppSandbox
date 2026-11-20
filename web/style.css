@@ -557,3 +557,16 @@ th.icon-col, td.icon-col {
     color: #888;
     text-align: center;
 }
+
+/* Resolution fields stay inside the editor's existing scrolling body. */
+#edit-display-settings { margin-top: 18px; }
+#edit-display-settings h4 { margin: 0 0 10px; font-size: 13px; }
+#edit-display-settings [hidden] { display: none; }
+.resolution-control { margin: 12px 0; }
+.resolution-control > label { display: block; margin-bottom: 6px; }
+.resolution-control select { max-width: 100%; }
+.resolution-dimensions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.resolution-dimensions input { width: 78px; min-width: 0; }
+.resolution-override { display: flex; gap: 7px; align-items: center; margin-top: 14px; }
+#edit-display-settings .field-warn { display: block; margin: 6px 0 0; }
+#edit-display-settings .field-warn:empty { display: none; }

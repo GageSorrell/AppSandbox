@@ -34,6 +34,7 @@ Environment:
 #include "screenshot.h"
 
 #include "Trace.h"
+#include "../transport/asb_display_resize.h"
 #include "../transport/asb_transport.h"   /* AsbConn — host connection (AF_HYPERV on PC, ivshmem on Mac) */
 #include "../../src/core/protocol.h"
 #include "../transport/asb_automation.h"
@@ -94,25 +95,12 @@ struct ResolutionEntry {
     UINT refresh = 60;
 };
 
+#include "../transport/asb_display_resolutions.h"
+#define ASB_VDD_RESOLUTION(w, h) { w, h },
 static const ResolutionEntry g_SupportedResolutions[] = {
-    { 1920, 1080 },
-    { 1024, 768 },
-    { 1280, 720 },
-    { 1280, 800 },
-    { 1280, 1024 },
-    { 1366, 768 },
-    { 1440, 900 },
-    { 1600, 900 },
-    { 1680, 1050 },
-    { 1920, 1200 },
-    { 2560, 1440 },
-    { 2560, 1600 },
-    { 3440, 1440 },
-    { 3840, 2160 },
-    { 5120, 1440 },
-    { 5120, 2880 },
-    { 7680, 4320 },
+    ASB_COMMON_DISPLAY_RESOLUTIONS(ASB_VDD_RESOLUTION)
 };
+#undef ASB_VDD_RESOLUTION
 
 static const UINT g_NumResolutions = ARRAYSIZE(g_SupportedResolutions);
 static const UINT VDD_MAX_MODES = g_NumResolutions + 1;
@@ -250,9 +238,11 @@ typedef struct _VDD_SWAP_PROC {
     BOOL                bGpuPoolFailed;
     BOOL                bGpuCapsSent;
     BOOL                bGpuHasFrame;
+    volatile LONG       modeHasFrame;
     BOOL                bGpuSourceKnown;
     BOOL                bGpuSourceCompatible;
     BOOL                gpuResizeSupported;
+    BOOL                cpuResizeSupported;
     BOOL                gpuScreenshotSupported;
     BOOL                gpuModeNotified;
     DisplayGpuPacket    gpuControl;
@@ -300,6 +290,10 @@ typedef struct _VDD_DEVICE_CONTEXT {
     UINT64              gpuModeSession;
     volatile LONG       gpuModes;
     volatile LONG       fullModes;
+    volatile LONG       cpuResizeEnabled; /* latched Windows capability; retain working mode on disconnect */
+    ResolutionEntry     resizeRollback;
+    BOOL                resizeRollbackMatch;
+    ULONGLONG           resizeDeadline; /* displayWorkLock; one bounded rollback attempt */
     volatile LONG       stopping;
     volatile LONG       reconfiguring;
     BOOL                swapChanging;

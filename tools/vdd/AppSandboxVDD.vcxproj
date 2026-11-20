@@ -42,6 +42,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="vdd.h" />
+    <ClInclude Include="..\transport\asb_display_resize.h" />
+    <ClInclude Include="..\transport\asb_display_resolutions.h" />
     <ClInclude Include="screenshot.h" />
     <ClInclude Include="Trace.h" />
   </ItemGroup>
