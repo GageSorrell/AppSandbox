@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+[ "$(git symbolic-ref --quiet --short HEAD || :)" = feat/custom-resolution ] || exit 0
+[ "${BEADS_GIT_SYNC_RUNNING:-}" != 1 ] || exit 0
+export BEADS_GIT_SYNC_RUNNING=1
+
+if command -v bd >/dev/null 2>&1; then
+    beads_command=bd
+elif [ -n "${LOCALAPPDATA:-}" ] && [ -x "$LOCALAPPDATA/beads/bd.exe" ]; then
+    beads_command="$LOCALAPPDATA/beads/bd.exe"
+else
+    echo 'Beads sync failed: install bd and put it on PATH.' >&2
+    exit 1
+fi
+
+echo "Beads: bd dolt $1" >&2
+if "$beads_command" dolt "$1"; then
+    exit 0
+else
+    result=$?
+    echo "Beads sync failed; retry with: bd dolt $1" >&2
+    exit "$result"
+fi

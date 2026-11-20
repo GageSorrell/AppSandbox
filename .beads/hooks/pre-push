@@ -1,0 +1,10 @@
+#!/bin/sh
+# Sync only when this branch is actually included in the push.
+sync_branch=false
+while read -r local_ref local_oid remote_ref remote_oid; do
+    if [ "$local_ref" = refs/heads/feat/custom-resolution ]; then
+        sync_branch=true
+    fi
+done
+[ "$sync_branch" = true ] || exit 0
+exec sh "$(dirname "$0")/sync" push
