@@ -1,0 +1,1 @@
+Installed. devcon exit=0. Reboot and verify the active display driver and resizing.

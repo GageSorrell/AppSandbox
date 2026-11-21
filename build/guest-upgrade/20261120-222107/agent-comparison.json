@@ -1,0 +1,32 @@
+[
+  {
+    "Name": "appsandbox-agent.exe",
+    "Identical": false,
+    "Signature": 0
+  },
+  {
+    "Name": "appsandbox-input.exe",
+    "Identical": false,
+    "Signature": 0
+  },
+  {
+    "Name": "appsandbox-displays.exe",
+    "Identical": false,
+    "Signature": 0
+  },
+  {
+    "Name": "appsandbox-clipboard.exe",
+    "Identical": false,
+    "Signature": 0
+  },
+  {
+    "Name": "appsandbox-clipboard-reader.exe",
+    "Identical": false,
+    "Signature": 0
+  },
+  {
+    "Name": "appsandbox-audio.exe",
+    "Identical": false,
+    "Signature": 0
+  }
+]

@@ -1,0 +1,10 @@
+{
+  "CheckedAt": "2026-11-20T22:36:23.7219626-05:00",
+  "InstalledDllMatches": true,
+  "AgentStatus": "Running",
+  "Resolution": {
+    "CurrentHorizontalResolution": 3440,
+    "CurrentVerticalResolution": 1440,
+    "ConfigManagerErrorCode": 0
+  }
+}

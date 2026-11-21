@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>App Sandbox</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<!-- spellcheck="false" inherits to all descendants; the per-field
+     autocorrect/autocapitalize attrs (WebKit/Safari extensions) stop macOS from
+     rewriting VM names, usernames, paths, and snapshot names as you type. -->
+<body spellcheck="false" autocorrect="off" autocapitalize="off">
+
+<!-- Virtual Machines -->
+<section id="vm-section">
+    <div class="section-header">
+        <h2>Sandboxes</h2>
+        <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
+    </div>
+    <div class="vm-table-wrap">
+        <table id="vm-table">
+            <thead><tr>
+                <th>Name</th>
+                <th>OS</th>
+                <th>Status</th>
+                <th>Agent</th>
+                <th>CPU</th>
+                <th>RAM (MB)</th>
+                <th>HDD (GB)</th>
+                <th>GPU</th>
+                <th>Network</th>
+                <th class="win-only">Snapshot</th>
+                <th class="icon-col">&#x25B6;&#xFE0F;</th>
+                <th class="icon-col" title="IDD Display">&#x1F4FA;</th>
+                <th class="icon-col" title="SSH">&gt;_</th>
+                <th class="icon-col">&#x23FB;</th>
+                <th class="icon-col">&#x2715;&#xFE0F;</th>
+                <th class="icon-col">&#x1F5D1;&#xFE0F;</th>
+                <th class="icon-col">&#x270F;&#xFE0F;</th>
+            </tr></thead>
+            <tbody id="vm-tbody"></tbody>
+        </table>
+    </div>
+</section>
+
+<!-- Log -->
+<section id="log-section">
+    <h2 class="collapsible" onclick="toggleSection('log-section')"><span class="collapse-arrow" id="log-section-arrow">&#x25BC;</span> Log</h2>
+    <div id="log-panel"></div>
+</section>
+
+<!-- Prerequisite modal -->
+<div class="modal-overlay" id="prereq-overlay">
+    <div class="modal">
+        <h3>Virtual Machine Platform Required</h3>
+        <p id="prereq-message">App Sandbox requires the <strong>Virtual Machine Platform</strong> Windows feature to create and run VMs. This feature is not currently enabled.</p>
+        <div class="modal-buttons" id="prereq-buttons">
+            <button onclick="document.getElementById('prereq-overlay').classList.remove('active')">Cancel</button>
+            <button class="primary" onclick="enableFeature()">Enable</button>
+        </div>
+    </div>
+</div>
+
+<!-- Create Sandbox modal -->
+<div class="modal-overlay" id="create-vm-overlay">
+    <div class="modal wide">
+        <h3>New Sandbox</h3>
+        <div class="modal-form-body">
+        <div class="form-grid">
+            <label for="os-type">OS Type:</label>
+            <div class="form-row">
+                <select id="os-type" onchange="applyOsTypeUI()">
+                    <option value="windows11" selected>Windows 11</option>
+                    <option value="ubuntu2604lts">Ubuntu 26.04 LTS</option>
+                    <option value="macos27">macOS 27</option>
+                </select>
+            </div>
+
+            <label for="vm-name">VM Name:</label>
+            <div class="form-row">
+                <input type="text" id="vm-name" value="MyAppSandbox" class="input-md" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <span class="field-warn" id="vm-name-warn"></span>
+            </div>
+
+            <label>OS Image:</label>
+            <div class="image-row">
+                <span id="macos-image-source" style="display:none">Automatic download</span>
+                <input type="text" id="image-path" class="needs-iso" placeholder="Path to ISO..." autocorrect="off" autocapitalize="off" spellcheck="false">
+                <button id="btn-browse" class="needs-iso" onclick="sendCmd('browseImage')">Browse...</button>
+                <span class="or-separator templates-supported">OR</span>
+                <label class="templates-supported" style="text-align:left">Template:</label>
+                <div class="template-dropdown templates-supported" id="template-dropdown">
+                    <div class="template-dropdown-selected" id="template-dropdown-selected">(None)</div>
+                    <div class="template-dropdown-list" id="template-dropdown-list"></div>
+                    <input type="hidden" id="template-select" value="">
+                </div>
+            </div>
+
+            <label class="needs-linux-version">Distribution:</label>
+            <div class="form-row needs-linux-version">
+                <select id="linux-version">
+                    <option value="ubuntu-26.04" selected>Ubuntu 26.04 LTS</option>
+                </select>
+                <span class="host-info">Downloaded on first create (~600 MB), cached on the host</span>
+            </div>
+
+            <label for="hdd-size">HDD Size:</label>
+            <div class="form-row">
+                <input type="number" id="hdd-size" value="64" min="64" class="input-sm"> GB
+                <button id="btn-disk-location" class="disk-location-btn" aria-haspopup="dialog" title="HDD Location" onclick="openDiskLocationModal()">HDD location...</button>
+                <span class="host-info" id="host-hdd"></span>
+            </div>
+
+            <label for="ram-size">RAM Size:</label>
+            <div class="form-row">
+                <input type="number" id="ram-size" value="12288" min="4096" step="2" class="input-sm"> MB
+                <span class="host-info" id="host-ram"></span>
+            </div>
+
+            <label for="cpu-cores">CPU Cores:</label>
+            <div class="form-row">
+                <input type="number" id="cpu-cores" value="8" min="1" class="input-sm">
+                <span class="host-info" id="host-cpu"></span>
+            </div>
+
+            <label for="gpu-mode">GPU:</label>
+            <div class="form-row">
+                <select id="gpu-mode">
+                    <option value="0">None</option>
+                    <option value="1" selected>Default GPU</option>
+                </select>
+            </div>
+
+            <label for="net-mode" class="windows-host-only">Network:</label>
+            <div class="form-row windows-host-only">
+                <select id="net-mode" onchange="onNetModeChange()">
+                    <option value="0">None</option>
+                    <option value="1" selected>NAT</option>
+                    <option value="2">External</option>
+                    <option value="3">Internal</option>
+                </select>
+                <label id="net-adapter-label" style="text-align:left">Adapter:</label>
+                <select id="net-adapter"></select>
+            </div>
+
+            <label>Username:</label>
+            <div class="cred-row">
+                <input type="text" id="admin-user" value="user" class="input-md" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" required>
+                <span class="field-warn" id="admin-user-warn"></span>
+            </div>
+
+            <label>Password:</label>
+            <div class="cred-row">
+                <input type="password" id="admin-pass" value="test123" required>
+                <label>Confirm:</label>
+                <input type="password" id="admin-confirm" value="test123" required>
+                <span class="toggle-pass" onmousedown="showPassword()" onmouseup="hidePassword()" onmouseleave="hidePassword()">&#x1F441;</span>
+                <span class="field-warn" id="admin-pass-warn"></span>
+            </div>
+
+            <label>Options:</label>
+            <div class="form-row">
+                <label class="needs-windows" title="Disable Secure Boot and enable test-signing (required to load the test-signed guest drivers)"><input type="checkbox" id="test-mode"> Test Mode</label>
+                <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled" onchange="onSshToggle()"> SSH Server</label>
+                <label title="Deploy the AppSandbox SSH public key so you can connect with key auth (requires SSH Server)"><input type="checkbox" id="ssh-deploy-key" disabled> Deploy SSH key</label>
+            </div>
+        </div>
+        </div>
+        <div class="modal-buttons">
+            <button onclick="closeCreateModal()">Cancel</button>
+            <button id="btn-create-template" class="templates-supported" disabled onclick="onCreateTemplate()">Build Template</button>
+            <button id="btn-create" class="primary" disabled onclick="onCreateVm()">Create Sandbox</button>
+        </div>
+    </div>
+</div>
+
+<!-- HDD location modal -->
+<div class="modal-overlay" id="disk-location-overlay">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="disk-location-title">
+        <h3 id="disk-location-title">HDD Location</h3>
+        <p id="disk-directory-help">Choose an existing folder. Disks are stored in a subfolder named after the VM.</p>
+        <div class="disk-directory-field">
+            <label for="disk-directory" class="disk-directory-label">Folder:</label>
+            <div class="disk-directory-row">
+                <input type="text" id="disk-directory" aria-describedby="disk-directory-help disk-directory-warn" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <button id="btn-browse-disk-directory" onclick="sendCmd('browseDiskDirectory', { path: document.getElementById('disk-directory').value.trim() })">Browse...</button>
+            </div>
+            <span id="disk-directory-warn" class="field-warn" aria-live="polite"></span>
+            <span id="disk-location-space" class="host-info" aria-live="polite"></span>
+        </div>
+        <div class="modal-buttons">
+            <button onclick="closeDiskLocationModal(false)">Cancel</button>
+            <button id="btn-save-disk-location" class="primary" onclick="closeDiskLocationModal(true)">Save</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="edit-vm-overlay">
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="edit-vm-title">
+        <h3 id="edit-vm-title">Edit</h3>
+        <div class="modal-form-body">
+            <div class="form-grid">
+                <label for="edit-ram-size">RAM Size:</label>
+                <div class="form-row">
+                    <input type="number" id="edit-ram-size" min="4096" step="2" class="input-sm" aria-describedby="edit-vm-warn"> MB
+                    <span class="host-info" id="edit-host-ram"></span>
+                </div>
+
+                <label for="edit-cpu-cores">CPU Cores:</label>
+                <div class="form-row">
+                    <input type="number" id="edit-cpu-cores" min="1" class="input-sm" aria-describedby="edit-vm-warn">
+                    <span class="host-info" id="edit-host-cpu"></span>
+                </div>
+
+                <label for="edit-gpu-mode" class="win-only">GPU:</label>
+                <div class="form-row win-only">
+                    <select id="edit-gpu-mode">
+                        <option value="0">None</option>
+                        <option value="1">Default GPU</option>
+                    </select>
+                </div>
+
+                <label for="edit-net-mode" class="win-only">Network:</label>
+                <div class="form-row win-only">
+                    <select id="edit-net-mode">
+                        <option value="0">None</option>
+                        <option value="1">NAT</option>
+                        <option value="2">External</option>
+                        <option value="3">Internal</option>
+                    </select>
+                </div>
+            </div>
+            <div id="edit-display-settings" hidden role="group" aria-labelledby="edit-display-title">
+                <h4 id="edit-display-title">Display resolution</h4>
+                <p id="edit-display-capability" class="field-warn" aria-live="polite"></p>
+                <div class="resolution-control">
+                    <label for="edit-windowed-preset">Windowed resolution</label>
+                    <select id="edit-windowed-preset" aria-describedby="edit-windowed-error edit-windowed-limit edit-windowed-small edit-display-capability"><option value="custom">Custom…</option></select>
+                    <div id="edit-windowed-custom" class="resolution-dimensions" hidden>
+                        <label for="edit-windowed-width">Width</label>
+                        <input type="number" id="edit-windowed-width" min="640" max="7680" step="1" inputmode="numeric" aria-describedby="edit-windowed-error edit-windowed-limit edit-windowed-small edit-display-capability">
+                        <span aria-hidden="true">×</span>
+                        <label for="edit-windowed-height">Height</label>
+                        <input type="number" id="edit-windowed-height" min="480" max="4320" step="1" inputmode="numeric" aria-describedby="edit-windowed-error edit-windowed-limit edit-windowed-small edit-display-capability">
+                    </div>
+                    <p id="edit-windowed-error" class="field-warn" aria-live="polite"></p>
+                    <p id="edit-windowed-limit" class="field-warn" aria-live="polite"></p>
+                    <p id="edit-windowed-small" class="field-warn" aria-live="polite"></p>
+                </div>
+                <label class="resolution-override"><input type="checkbox" id="edit-fullscreen-override" aria-controls="edit-fullscreen-settings"> Use custom fullscreen resolution</label>
+                <div id="edit-fullscreen-settings" hidden>
+                <div class="resolution-control">
+                    <label for="edit-fullscreen-preset">Fullscreen resolution</label>
+                    <select id="edit-fullscreen-preset" aria-describedby="edit-fullscreen-error edit-fullscreen-limit edit-fullscreen-small edit-display-capability"><option value="custom">Custom…</option></select>
+                    <div id="edit-fullscreen-custom" class="resolution-dimensions" hidden>
+                        <label for="edit-fullscreen-width">Width</label>
+                        <input type="number" id="edit-fullscreen-width" min="640" max="7680" step="1" inputmode="numeric" aria-describedby="edit-fullscreen-error edit-fullscreen-limit edit-fullscreen-small edit-display-capability">
+                        <span aria-hidden="true">×</span>
+                        <label for="edit-fullscreen-height">Height</label>
+                        <input type="number" id="edit-fullscreen-height" min="480" max="4320" step="1" inputmode="numeric" aria-describedby="edit-fullscreen-error edit-fullscreen-limit edit-fullscreen-small edit-display-capability">
+                    </div>
+                    <p id="edit-fullscreen-error" class="field-warn" aria-live="polite"></p>
+                    <p id="edit-fullscreen-limit" class="field-warn" aria-live="polite"></p>
+                    <p id="edit-fullscreen-small" class="field-warn" aria-live="polite"></p>
+                </div>
+                </div>
+            </div>
+            <span id="edit-vm-warn" class="field-warn" aria-live="polite"></span>
+        </div>
+        <div class="modal-buttons">
+            <button onclick="closeEditVmModal()">Cancel</button>
+            <button id="btn-save-edit-vm" class="primary" onclick="saveEditVm()">Save</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="snapshot-overlay">
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="snapshot-title">
+        <h3 id="snapshot-title">Snapshots</h3>
+        <div class="modal-form-body">
+            <p id="snapshot-current"></p>
+            <div id="snapshot-tree" role="group" aria-label="Snapshots and branches" aria-describedby="snapshot-help"></div>
+            <p id="snapshot-help"></p>
+            <span id="snapshot-warn" class="field-warn" aria-live="polite"></span>
+        </div>
+        <div class="modal-buttons">
+            <button id="btn-snapshot-create" class="primary" onclick="takeSnapshot()">New Snapshot</button>
+            <button id="btn-snapshot-rename" onclick="renameSnapshot()">Rename</button>
+            <button id="btn-snapshot-delete" class="danger" onclick="deleteSnapshot()">Delete</button>
+            <button onclick="closeSnapshotModal()">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Confirm modal -->
+<div class="modal-overlay" id="modal-overlay">
+    <div class="modal">
+        <h3 id="modal-title">Confirm</h3>
+        <p id="modal-message"></p>
+        <label style="display:none; font-size:12px; color:var(--text-dim); cursor:pointer; margin-bottom:8px;">
+            <input type="checkbox" id="modal-dont-show"> Don't show this again
+        </label>
+        <div id="modal-input-row" style="display:none; margin-bottom:12px;">
+            <label style="font-size:12px; color:var(--text-dim);" id="modal-input-label">Name:</label>
+            <input type="text" id="modal-input" style="width:100%; margin-top:4px;" autocorrect="off" autocapitalize="off" spellcheck="false">
+        </div>
+        <div class="modal-buttons">
+            <button onclick="modalResolve(false)">Cancel</button>
+            <button class="danger" onclick="modalResolve(true)" id="modal-confirm-btn">Delete</button>
+        </div>
+    </div>
+</div>
+
+<script src="display-resolution.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,102 @@
+[
+  {
+    "Path": "drivers\\AppSandboxSHM.cat",
+    "Hash": "9FFA6834858CBCAE40415BBD96C302EBD33B2E993C93FDAAD2CC0E1424C2F270"
+  },
+  {
+    "Path": "drivers\\AppSandboxSHM.inf",
+    "Hash": "BF549AA2AB64F8AB2FC17BB8AF194F9945107E970384EF45FC64C24E26F31581"
+  },
+  {
+    "Path": "drivers\\AppSandboxSHM.sys",
+    "Hash": "F2F2917896F4A3E760174B219BD273A6BBCC92B278C25E3AA28239EC50FB4888"
+  },
+  {
+    "Path": "drivers\\AppSandboxVAD.cat",
+    "Hash": "1F463EC0626BC1297A97B4CAD04CB1D10C90414C271F0A8C4611108716A09255"
+  },
+  {
+    "Path": "drivers\\AppSandboxVAD.inf",
+    "Hash": "36F47008EF5028C973E68B6CA36DC6CC864152E02391473D8F9AB8BE39B5DB5C"
+  },
+  {
+    "Path": "drivers\\AppSandboxVAD.sys",
+    "Hash": "6FD94B8187F82CBC0FEA1E4370A5EB0CA8C66C2EB1AF4519130685EFC17E4A77"
+  },
+  {
+    "Path": "drivers\\AppSandboxVDD.cat",
+    "Hash": "FE50437E44EB88784BFFD691B278A8D0DF5B01FCC1705C68DF3BE1B4956D8F10"
+  },
+  {
+    "Path": "drivers\\AppSandboxVDD.cer",
+    "Hash": "265458FCD1122F5377D3ED101654EAADEB6CCC1F92F5BA4F67CB32B491C72346"
+  },
+  {
+    "Path": "drivers\\AppSandboxVDD.dll",
+    "Hash": "71C31B9C31269B50443F0D2B8C20C606B2F282BE45EAAA9893344377CE3C3E53"
+  },
+  {
+    "Path": "drivers\\AppSandboxVDD.inf",
+    "Hash": "50543F0C8A1D2DF878DDAAFC66AC9C580FA2E313FBA8C654D5D28404CAE81121"
+  },
+  {
+    "Path": "drivers\\devcon.exe",
+    "Hash": "282FF232C35FCB82DAD2FDAE56C775523409494B175A5A83D7441B5FA65CB3F9"
+  },
+  {
+    "Path": "resources\\appsandbox-agent.exe",
+    "Hash": "EECDCBDC4B66EF53DEFF1CD5281C240E4BBEDBF15F5B92BC69D4A0CBFA168006"
+  },
+  {
+    "Path": "resources\\appsandbox-audio.exe",
+    "Hash": "84DFD86296E631210ED10697964581C966CDAB99F734B1E2D5097E353034B2AD"
+  },
+  {
+    "Path": "resources\\appsandbox-clipboard-reader.exe",
+    "Hash": "EB13145BB39877A4333ECC234972ACE83AE59C07D6FDA0959A3C69AA0B6C055D"
+  },
+  {
+    "Path": "resources\\appsandbox-clipboard.exe",
+    "Hash": "68CB0BBF0F76C386FC4E928E08EA17661BFAE4B87570A81EB930B47D2860F0D5"
+  },
+  {
+    "Path": "resources\\appsandbox-displays.exe",
+    "Hash": "214488CA96B490AD1BBCCBF5B8476F3ED6BB719967E9D81510456299D9A25B1E"
+  },
+  {
+    "Path": "resources\\appsandbox-input.exe",
+    "Hash": "4B129D2ADA5E538EACD18C2C688508EFE6FB7AFE7DEAAC4A4044E7BB233F83E4"
+  },
+  {
+    "Path": "resources\\nvidia\\appsandbox-nvidia-cuda-shim.dll",
+    "Hash": "7FFEA4E6481F94E59BD4CF660F202F7612384A64AB20FCD8B7AF99252D03AAF8"
+  },
+  {
+    "Path": "resources\\nvidia\\appsandbox-nvidia-dlss-shim.dll",
+    "Hash": "060A354C9F19838670EA915551339EC16CA09E74D58D4322983912102A3969B8"
+  },
+  {
+    "Path": "resources\\nvidia\\appsandbox-nvidia-opencl-shim.dll",
+    "Hash": "D370C29AFD50F9216B2DB6DCC88E62A0EE8ADB6CF2BA742318FEBC8D57BBCCA0"
+  },
+  {
+    "Path": "resources\\nvidia\\appsandbox-nvidia-vk-gl-shim.dll",
+    "Hash": "49748A2B3FA25F72F34039FE9DC2E7F453949AB3FA784F13D42309E9D2A407FB"
+  },
+  {
+    "Path": "resources\\nvidia\\appsandbox-nvidia-vk-gl-shim32.dll",
+    "Hash": "DAC8AE232821029663F11034AC3D754AA47800DB2FF9AE5C79168CB3BBEF32BE"
+  },
+  {
+    "Path": "resources\\win-mesa-gl\\gallium_wgl.dll",
+    "Hash": "6A621CA2BE99DA23E8AEF85049D52915136521AA4DCCBF2E21AB3C18E3C4B071"
+  },
+  {
+    "Path": "resources\\win-mesa-gl\\opengl32.dll",
+    "Hash": "E1FE110247414C263295B2448E46A5FD5796B73C867BE741A00351E453E7AF7B"
+  },
+  {
+    "Path": "resources\\win-mesa-gl\\z-1.dll",
+    "Hash": "72CC611B2F9DB97D5A07457582D9C2DD267190EF185687C899DF582B4BB9745D"
+  }
+]

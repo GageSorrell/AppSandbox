@@ -1,0 +1,16 @@
+Staged only; no service, driver, certificate, or boot settings have been changed.
+The running guest has Secure Boot enabled and is not in Test Mode.
+Installation requires explicit approval for the development-driver security setup.
+The installation script intentionally does not change boot security settings.
+
+Backup contains the original guest agent executables and packaged drivers.
+Installation also exports the active VDD driver store package before updating it.
+Rollback (Administrator): update ROOT\AppSandboxVDD using backup\drivers\devcon.exe
+and backup\drivers\AppSandboxVDD.inf; stop AppSandboxAgent and its helpers,
+restore backed-up executables to C:\Windows\AppSandbox, restart the service,
+and reboot. Restore original guest driver package files from backup\drivers.
+After restoring the Microsoft-signed driver, Test Mode can be disabled and
+Secure Boot restored on the host. Do not restore Secure Boot while relying on
+this local test-signed driver. Keep direct host console access for recovery.
+Physical display, custom resolution, input, clipboard and audio verification
+remain necessary after installation. The script does not reboot automatically.
