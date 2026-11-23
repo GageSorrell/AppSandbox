@@ -1,0 +1,2 @@
+/* Guest tray icon of the Remote Windows helper (AppSandbox-eh6.8). */
+1 ICON "../../src/app_win/appsandbox.ico"

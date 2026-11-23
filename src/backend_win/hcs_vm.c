@@ -185,53 +185,6 @@ static BOOL get_current_user_sid_string(wchar_t *out, size_t out_chars)
     return ok;
 }
 
-void hcs_service_guid(const wchar_t *os_type, unsigned port, GUID *out)
-{
-    /* Default to Windows-style GUIDs whenever os_type isn't explicitly
-       set to a non-Windows value. Protects existing Windows VMs from any
-       regression if their os_type field happens to be missing/empty —
-       e.g. a vms.cfg entry from an older build that pre-dates the field.
-       Only the explicit string "Linux" (or any other non-Windows guest
-       string in the future) flips to the vsock-template GUIDs. */
-    BOOL is_windows = !os_type
-                   || os_type[0] == L'\0'
-                   || _wcsicmp(os_type, L"Windows") == 0;
-    if (is_windows) {
-        /* a5b0cafe-<port>-4000-8000-000000000001 — the original AppSandbox
-           service GUIDs, reached via AF_HYPERV from a Windows guest. */
-        out->Data1    = 0xa5b0cafeu;
-        out->Data2    = (unsigned short)port;
-        out->Data3    = 0x4000;
-        out->Data4[0] = 0x80; out->Data4[1] = 0x00;
-        out->Data4[2] = 0x00; out->Data4[3] = 0x00;
-        out->Data4[4] = 0x00; out->Data4[5] = 0x00;
-        out->Data4[6] = 0x00; out->Data4[7] = 0x01;
-    } else {
-        /* <port>-FACB-11E6-BD58-64006A7986D3 — the Linux vsock template.
-           A Linux guest calling bind/connect on AF_VSOCK port N is mapped
-           by hv_sock onto exactly this GUID on the Hyper-V side. */
-        out->Data1    = port;
-        out->Data2    = 0xFACB;
-        out->Data3    = 0x11E6;
-        out->Data4[0] = 0xBD; out->Data4[1] = 0x58;
-        out->Data4[2] = 0x64; out->Data4[3] = 0x00;
-        out->Data4[4] = 0x6A; out->Data4[5] = 0x79;
-        out->Data4[6] = 0x86; out->Data4[7] = 0xD3;
-    }
-}
-
-void hcs_service_guid_str(const wchar_t *os_type, unsigned port,
-                          wchar_t *out, size_t out_chars)
-{
-    GUID g;
-    hcs_service_guid(os_type, port, &g);
-    swprintf_s(out, out_chars,
-        L"%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-        g.Data1, g.Data2, g.Data3,
-        g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
-        g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
-}
-
 /* HCS_E_OPERATION_TIMEOUT — returned by HcsWaitForOperationResult on timeout */
 #ifndef HCS_E_OPERATION_TIMEOUT
 #define HCS_E_OPERATION_TIMEOUT ((HRESULT)0x80370102L)
@@ -903,7 +856,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     wchar_t video_section[2048];
     wchar_t comports_section[512];
     wchar_t plan9_section[5120];
-    wchar_t service_table[2048];
+    wchar_t service_table[4096];
     wchar_t vmgs_path[MAX_PATH];
     wchar_t vmrs_path[MAX_PATH];
     wchar_t dir[MAX_PATH];
@@ -1105,34 +1058,14 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         }
     }
 
-    /* ServiceTable: list the AppSandbox service GUIDs the guest is
-       permitted to bind on. Windows guests get the a5b0cafe-XXXX-...
-       form (reached via AF_HYPERV from the in-VM agent and helpers).
-       Linux guests get the vsock-template form so a guest doing
-       bind(AF_VSOCK, port=N) ends up registered as the corresponding
-       <N>-FACB-... GUID on the host side. Same security descriptors
-       for both. Ports 1–6 cover agent + frame + input + audio + the
-       two clipboard channels. */
-
-    {
-        wchar_t entry[256];
-        wchar_t guid_str[64];
-        unsigned port;
-        service_table[0] = L'\0';
-        BOOL windows_guest=_wcsicmp(config->os_type,L"Windows")==0;
-        unsigned last_port=ASB_CH_SCREENSHOT;
-        for (port = 1; port <= last_port; port++) {
-            if (!windows_guest && port==7) continue;
-            hcs_service_guid_str(config->os_type, port, guid_str, 64);
-            swprintf_s(entry, 256,
-                L"%s\"%s\":{"
-                    L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                    L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                    L"\"AllowWildcardBinds\":true"
-                L"}",
-                (port > 1) ? L"," : L"", guid_str);
-            wcscat_s(service_table, 2048, entry);
-        }
+    /* ServiceTable: the AppSandbox service GUIDs the guest may bind (channels 1-8, plus
+       Remote Windows control/frames/files 9-11 for Windows guests only). Windows guests get
+       the a5b0cafe-XXXX-... form (AF_HYPERV); Linux guests get the vsock-template form so
+       bind(AF_VSOCK, port=N) registers as the matching <N>-FACB-... GUID. Running VMs pick up
+       new services on their next start. */
+    if (hcs_service_table_json(config->os_type, service_table, ARRAYSIZE(service_table)) < 0) {
+        ui_log(L"HCS: service table too large");
+        return FALSE;
     }
 
     /* Nested virtualization — default ON, gated on host capability exactly like

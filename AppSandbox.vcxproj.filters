@@ -91,6 +91,30 @@
     <ClCompile Include="src\backend_win\gpu_broker.c">
       <Filter>Backend Win</Filter>
     </ClCompile>
+    <ClCompile Include="src\backend_win\remote_windows_frames_host.c">
+      <Filter>Backend Win</Filter>
+    </ClCompile>
+    <ClCompile Include="src\backend_win\remote_windows_session.c">
+      <Filter>Backend Win</Filter>
+    </ClCompile>
+    <ClCompile Include="src\backend_win\remote_windows_host.c">
+      <Filter>Backend Win</Filter>
+    </ClCompile>
+    <ClCompile Include="src\backend_win\vm_integration.c">
+      <Filter>Backend Win</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\agent\remote_windows_flyout.c">
+      <Filter>Backend Win</Filter>
+    </ClCompile>
+    <ClCompile Include="src\backend_win\remote_windows_proxy.cpp">
+      <Filter>Backend Win</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\transport\asb_rw_frames.c">
+      <Filter>Backend Win</Filter>
+    </ClCompile>
+    <ClCompile Include="tools\transport\asb_remote_windows.c">
+      <Filter>Backend Win</Filter>
+    </ClCompile>
     <ClCompile Include="src\app_win\headless.c">
       <Filter>App</Filter>
     </ClCompile>
@@ -122,6 +146,27 @@
       <Filter>Backend Win</Filter>
     </ClInclude>
     <ClInclude Include="src\backend_win\gpu_broker.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
+    <ClInclude Include="src\backend_win\remote_windows_frames_host.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
+    <ClInclude Include="src\backend_win\remote_windows_session.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
+    <ClInclude Include="src\backend_win\remote_windows_host.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
+    <ClInclude Include="src\backend_win\vm_integration.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\agent\remote_windows_flyout.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
+    <ClInclude Include="src\backend_win\remote_windows_proxy.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
+    <ClInclude Include="tools\transport\asb_rw_frames.h">
       <Filter>Backend Win</Filter>
     </ClInclude>
   </ItemGroup>

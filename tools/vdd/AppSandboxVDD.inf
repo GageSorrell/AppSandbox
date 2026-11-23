@@ -47,6 +47,8 @@ AddReg = AppSandboxVDD_HWAddReg
 [AppSandboxVDD_HWAddReg]
 HKR,, "UpperFilters",  %REG_MULTI_SZ%, "IndirectKmd"
 HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "AppSandboxVDDGroup"
+; Interactive standard-user helper may use the bounded private-display IOCTL.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)"
 
 [AppSandboxVDD_Install.NT.Services]
 Include = WUDFRD.inf

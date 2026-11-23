@@ -6,6 +6,12 @@ static void generation(AsbInputRouter *r)
     if (!++r->generation) ++r->generation;
 }
 
+static void epoch(AsbInputRouter *r)
+{
+    if (!++r->user_epoch) ++r->user_epoch;
+    r->hold=r->held_count=0;
+}
+
 static int emit(AsbInputRouter *r,uint32_t type,uint32_t a,uint32_t b,uint32_t c)
 {
     InputPacket packet={INPUT_MAGIC,type,a,b,c};
@@ -33,10 +39,11 @@ static int release(AsbInputRouter *r)
 static uint32_t transfer(AsbInputRouter *r,uint32_t owner)
 {
     generation(r);
+    epoch(r);
     r->transition=owner+1;
     if (!++r->sequence) ++r->sequence;
     r->transition_id=r->sequence|0x80000000u;
-    if (!release(r) || !emit(r,INPUT_MOUSE_QUERY,INPUT_MOUSE_NORMALIZED_VERSION,r->transition_id,0)) {
+    if (!release(r) || !emit(r,INPUT_MOUSE_QUERY,INPUT_MOUSE_VIRTUAL_VERSION,r->transition_id,0)) {
         asb_input_router_disconnect(r);
         return 29;
     }
@@ -47,6 +54,7 @@ void asb_input_router_init(AsbInputRouter *r,AsbInputEmit callback,void *context
 {
     memset(r,0,sizeof(*r));
     r->generation=1;
+    r->user_epoch=1;
     r->cursor_x=r->cursor_y=UINT32_MAX;
     r->emit=callback;
     r->context=context;
@@ -131,6 +139,7 @@ void asb_input_router_reply(AsbInputRouter *r,const InputPacket *p)
 void asb_input_router_disconnect(AsbInputRouter *r)
 {
     generation(r);
+    epoch(r);
     memset(r->scan,0,sizeof(r->scan));
     memset(r->vk,0,sizeof(r->vk));
     memset(r->legacy,0,sizeof(r->legacy));
@@ -148,4 +157,97 @@ uint32_t asb_input_router_flags(const AsbInputRouter *r)
     if (r->paused) flags|=ASB_STATUS_USER_PAUSED;
     if (r->cancelled) flags|=ASB_STATUS_AGENT_CANCELLED;
     return flags;
+}
+
+/* ---- user sources (AppSandbox-eh6.7) ---- */
+
+static int is_keyboard(const InputPacket *p)
+{
+    return p->type==INPUT_KEY || p->type==INPUT_KEY_PHYSICAL || p->type==INPUT_UNICODE;
+}
+
+static int is_release(const InputPacket *p)
+{
+    return ((p->type==INPUT_KEY || p->type==INPUT_KEY_PHYSICAL) && (p->param3&INPUT_KEY_UP)) ||
+           (p->type==INPUT_MOUSE_BUTTON && !p->param2);
+}
+
+static void forget_held(AsbInputRouter *r)
+{
+    memset(r->scan,0,sizeof(r->scan));
+    memset(r->vk,0,sizeof(r->vk));
+    memset(r->legacy,0,sizeof(r->legacy));
+    r->buttons=0;
+}
+
+uint32_t asb_input_router_focus(AsbInputRouter *r,uint32_t source,int renew,uint64_t now_ms)
+{
+    if (source==r->user_source && !renew) return r->user_epoch;
+    /* The previous source's keys/buttons go up in the guest before anything else is sent. */
+    if (r->owner!=ASB_CONTROL_AGENT && !r->transition) release(r);
+    else forget_held(r);
+    r->user_source=source;
+    epoch(r);
+    if (r->guard_source && r->guard_source!=source && r->owner!=ASB_CONTROL_AGENT) {
+        r->hold=r->user_epoch;
+        r->hold_since=now_ms;
+    }
+    return r->user_epoch;
+}
+
+uint32_t asb_input_router_send_user(AsbInputRouter *r,uint32_t source,uint32_t lease,const InputPacket *p,uint64_t now_ms)
+{
+    if (!p || p->magic!=INPUT_MAGIC || !source) return 87;
+    if (p->type==INPUT_MOUSE_POSITION_QUERY) return emit(r,p->type,p->param1,p->param2,p->param3)?0:29;
+    if (r->transition || r->owner==ASB_CONTROL_AGENT) return 5;
+    if (source!=r->user_source) {
+        /* Only the viewer claims implicitly, and never with a release (already released). */
+        if (source!=ASB_INPUT_SOURCE_VIEWER || lease || is_release(p)) return 5;
+        asb_input_router_focus(r,source,0,now_ms);
+    }
+    if (lease && lease!=r->user_epoch) return 5;
+    if (r->hold && is_keyboard(p)) {
+        if (r->held_count>=ASB_INPUT_HOLD_MAX) return 14;
+        r->held[r->held_count++]=*p;
+        return 0;
+    }
+    if (!emit(r,p->type,p->param1,p->param2,p->param3)) return 29;
+    asb_input_router_observe(r,0,p);
+    return 0;
+}
+
+void asb_input_router_guard(AsbInputRouter *r,uint32_t source,int on)
+{
+    if (on) r->guard_source=source;
+    else if (r->guard_source==source) r->guard_source=0;
+}
+
+uint32_t asb_input_router_hold(AsbInputRouter *r,uint64_t now_ms)
+{
+    if (r->hold) return r->hold;
+    if (!r->guard_source || r->guard_source==r->user_source || r->owner==ASB_CONTROL_AGENT || r->transition) return 0;
+    r->hold=r->user_epoch;
+    r->hold_since=now_ms;
+    r->held_count=0;
+    return r->hold;
+}
+
+void asb_input_router_unhold(AsbInputRouter *r,uint32_t hold,int ok)
+{
+    uint32_t count=r->held_count;
+    if (!hold || r->hold!=hold) return;
+    r->hold=r->held_count=0;
+    if (!ok || r->owner==ASB_CONTROL_AGENT || r->transition) return;
+    for (uint32_t i=0;i<count;++i) {
+        const InputPacket *p=&r->held[i];
+        if (!emit(r,p->type,p->param1,p->param2,p->param3)) break;
+        asb_input_router_observe(r,0,p);
+    }
+}
+
+int asb_input_router_expire(AsbInputRouter *r,uint64_t now_ms)
+{
+    if (!r->hold || now_ms-r->hold_since<ASB_INPUT_HOLD_MS) return 0;
+    asb_input_router_unhold(r,r->hold,0);
+    return 1;
 }

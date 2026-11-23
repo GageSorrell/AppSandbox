@@ -4,9 +4,10 @@
  * Connects to the guest VM over AF_HYPERV sockets:
  *   :0002  Frame channel — receives frames, renders via D3D11 textured quad
  *   :0003  Input channel — forwards keyboard/mouse events to guest
- *   :0004  Audio channel — receives audio from guest, renders via WASAPI
  *
- * Clipboard sync (:0005/:0006) is handled by vm_clipboard.c.
+ * Clipboard sync (:0005/:0006) and audio playback (:0004) belong to the VM's shared
+ * integration services (vm_integration.c, eh6.7): the viewer is one clipboard focus client and
+ * holds a reference, so both survive closing the viewer while Remote Windows shares windows.
  *
  * Pure C, compiled as C.
  */
@@ -47,7 +48,7 @@
 #include "fullscreen_request.h"
 #include "../core/api_json.h"
 #include "../../tools/transport/asb_automation.h"
-#include "vm_clipboard.h"
+#include "vm_integration.h"
 #include "vm_agent.h"
 #include "hcs_vm.h"
 #include "ui.h"
@@ -92,31 +93,6 @@ static const GUID FRAME_SERVICE_GUID =
 static const GUID INPUT_SERVICE_GUID =
     { 0xa5b0cafe, 0x0003, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
-/* Audio capture channel — connects to guest audio helper (guest→host) */
-static const GUID AUDIO_SERVICE_GUID =
-    { 0xa5b0cafe, 0x0004, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
-
-/* ---- Audio wire protocol (mirror of tools/agent/appsandbox-audio.c) ---- */
-
-#define AUDIO_HEADER_MAGIC  0x31415341  /* 'ASA1' */
-
-#pragma pack(push, 1)
-typedef struct AudioHeader {
-    UINT32 magic;
-    UINT32 sample_rate;
-    UINT16 channels;
-    UINT16 bits_per_sample;
-    UINT16 format_tag;      /* 1=PCM, 3=IEEE_FLOAT */
-    UINT16 block_align;
-} AudioHeader;
-
-typedef struct AudioFrameHeader {
-    UINT32 bytes;
-} AudioFrameHeader;
-#pragma pack(pop)
-
-/* Clipboard reader-apply message (posted by vm_clipboard.c to our wndproc) */
-#define WM_CLIP_READER_APPLY (WM_APP + 11)
 
 /* ---- Frame protocol constants ---- */
 
@@ -139,6 +115,7 @@ typedef struct AudioFrameHeader {
 #define WM_IDD_CLIPBOARD_READY  (WM_USER + 106)
 #define WM_IDD_FULLSCREEN       (WM_USER + 107)
 #define WM_IDD_VIEWER_OPTIONS   (WM_USER + 108)
+#define WM_IDD_LOG              (WM_USER + 111) /* lParam: malloc'd line, freed by the handler */
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -354,14 +331,11 @@ struct VmDisplayIdd {
     HWND           log_list_hwnd;   /* listbox inside log window */
     HWND           render_hwnd;     /* child window for D3D11 rendering */
 
-    /* Clipboard (extracted to vm_clipboard.c) */
-    VmClipboard      clipboard;
+    /* Clipboard and audio: the VM's shared integration services (vm_integration.c) */
+    VmIntegration   *integration;
+    uint32_t         clip_client;
     BOOL             share_clipboard;
-
-    /* Audio playback channel (:0004 — guest→host render) */
-    volatile SOCKET  audio_socket;
-    HANDLE           audio_recv_thread;
-    volatile BOOL    audio_muted;
+    volatile BOOL    audio_muted;      /* cache of the VM-wide mute */
 
     /* Threads */
     HANDLE         recv_thread;
@@ -569,18 +543,11 @@ static void ensure_idd_class(HINSTANCE hInst)
 
 /* ---- Debug log panel ---- */
 
-static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
+static void idd_log_append(VmDisplayIdd *d, const wchar_t *buf)
 {
-    wchar_t buf[512];
-    va_list ap;
     LRESULT count;
 
-    if (!d || !d->log_list_hwnd || d->stop) return;
-
-    va_start(ap, fmt);
-    vswprintf_s(buf, 512, fmt, ap);
-    va_end(ap);
-
+    if (!d->log_list_hwnd) return;
     count = SendMessageW(d->log_list_hwnd, LB_ADDSTRING, 0, (LPARAM)buf);
 
     /* Trim old entries */
@@ -592,6 +559,31 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
     /* Scroll to bottom and force repaint even when not focused */
     SendMessageW(d->log_list_hwnd, LB_SETTOPINDEX, (WPARAM)(count - 1), 0);
     UpdateWindow(d->log_list_hwnd);
+}
+
+/* Callable from any thread, with any lock held. Only the viewer window thread touches
+   the log list directly; other threads post a copy. A synchronous cross-thread send
+   deadlocked natively: the render thread logged from d3d_resize_swap_chain() while
+   holding frame_cs, and the viewer thread (in the modal size loop) was waiting for
+   frame_cs in its IDT_PRESENT timer, so the viewer stopped responding mid-resize. */
+static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
+{
+    wchar_t buf[512];
+    va_list ap;
+
+    if (!d || !d->log_list_hwnd || d->stop) return;
+
+    va_start(ap, fmt);
+    vswprintf_s(buf, 512, fmt, ap);
+    va_end(ap);
+
+    if (GetWindowThreadProcessId(d->log_list_hwnd, NULL) == GetCurrentThreadId()) {
+        idd_log_append(d, buf);
+    } else {
+        HWND viewer = d->hwnd; /* NULL would post to this thread's own queue */
+        wchar_t *line = viewer ? _wcsdup(buf) : NULL;
+        if (line && !PostMessageW(viewer, WM_IDD_LOG, 0, (LPARAM)line)) free(line);
+    }
 }
 
 /* ---- Send input packet to guest ---- */
@@ -1193,244 +1185,6 @@ static DWORD WINAPI idd_input_thread_proc(LPVOID param)
     PostMessageW(d->hwnd,WM_IDD_INPUT_READY,0,0);
     return 0;
 }
-
-/* ==================================================================
- * Audio playback — guest -> host
- * ================================================================== */
-
-static const CLSID AUDIO_CLSID_MMDeviceEnumerator =
-    { 0xBCDE0395, 0xE52F, 0x467C, { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
-static const IID AUDIO_IID_IMMDeviceEnumerator =
-    { 0xA95664D2, 0x9614, 0x4F35, { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
-static const IID AUDIO_IID_IAudioClient =
-    { 0x1CB9AD4C, 0xDBFA, 0x4C32, { 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2 } };
-static const IID AUDIO_IID_IAudioRenderClient =
-    { 0xF294ACFC, 0x3146, 0x4483, { 0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2 } };
-
-static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
-{
-    VmDisplayIdd *d = (VmDisplayIdd *)param;
-    HRESULT hr;
-    BOOL com_ok = FALSE;
-    IMMDeviceEnumerator *pEnum = NULL;
-    IMMDevice *pDev = NULL;
-    IAudioClient *pAC = NULL;
-    IAudioRenderClient *pRC = NULL;
-    WAVEFORMATEX *renderfmt = NULL;
-    BYTE *scratch = NULL;
-    UINT32 scratch_cap = 0;
-    UINT32 buf_frames = 0;
-    UINT32 render_block_align = 0;
-    HANDLE render_event = NULL;
-    HANDLE audio_task = NULL;
-    DWORD audio_task_index = 0;
-    AudioHeader hdr;
-    BOOL stream_started = FALSE;
-    BOOL session_logged = FALSE;
-    int  header_misses = 0;
-
-    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE)
-        com_ok = TRUE;
-    audio_task = AvSetMmThreadCharacteristicsW(L"Audio", &audio_task_index);
-
-    /* Outer retry loop — keep trying to connect to the guest capture helper */
-    while (!d->stop) {
-        GUID svc; hcs_service_guid(d->os_type, 4, &svc);
-        SOCKET s = connect_to_hv_service(&d->runtime_id, &svc, 1000);
-        if (s == INVALID_SOCKET) {
-            int wait;
-            for (wait = 0; wait < 2000 && !d->stop; wait += 200)
-                Sleep(200);
-            continue;
-        }
-
-        /* Blocking recv for the session */
-        {
-            DWORD no_timeout = 0;
-            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
-        }
-        EnterCriticalSection(&d->frame_cs);
-        if (d->stop) {
-            LeaveCriticalSection(&d->frame_cs);
-            closesocket(s);
-            break;
-        }
-        d->audio_socket = s;
-        LeaveCriticalSection(&d->frame_cs);
-
-        /* Read one-shot AudioHeader.
-           The guest closes without sending a header when the VAD endpoint
-           isn't ready yet (e.g. before user login / audio stack init).
-           Log only the first miss per run so we don't spam. */
-        if (!recv_exact(d, s, &hdr, sizeof(hdr), FALSE) || hdr.magic != AUDIO_HEADER_MAGIC) {
-            if (header_misses == 0)
-                idd_log(d, L"Audio header bad/absent - guest not ready, retrying quietly.");
-            header_misses++;
-            goto session_cleanup;
-        }
-
-        idd_log(d, L"Audio connected (GUID :0004).");
-        session_logged = TRUE;
-        header_misses = 0;
-
-        idd_log(d, L"Audio header: %lu Hz, %u ch, %u bits, tag=%u.",
-                 hdr.sample_rate, hdr.channels, hdr.bits_per_sample, hdr.format_tag);
-
-        /* Set up WASAPI render on the default endpoint */
-        hr = CoCreateInstance(&AUDIO_CLSID_MMDeviceEnumerator, NULL,
-                               CLSCTX_ALL, &AUDIO_IID_IMMDeviceEnumerator,
-                               (void **)&pEnum);
-        if (FAILED(hr)) { idd_log(d, L"Audio: CoCreateInstance failed 0x%08lX.", hr); goto session_cleanup; }
-
-        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(pEnum, eRender, eConsole, &pDev);
-        if (FAILED(hr)) { idd_log(d, L"Audio: GetDefaultAudioEndpoint failed 0x%08lX.", hr); goto session_cleanup; }
-
-        hr = IMMDevice_Activate(pDev, &AUDIO_IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&pAC);
-        if (FAILED(hr)) { idd_log(d, L"Audio: Activate failed 0x%08lX.", hr); goto session_cleanup; }
-
-        /* Build the source format exactly matching what the guest is sending.
-           We deliberately do NOT call GetMixFormat: we never use the host's
-           mix format (Initialize runs with AUTOCONVERTPCM, so WASAPI converts
-           our renderfmt to whatever the endpoint needs). On some endpoints
-           (seen on AMD HD Audio) GetMixFormat returns
-           AUDCLNT_E_UNSUPPORTED_FORMAT for the configured default format,
-           which would needlessly kill the whole audio path. */
-        renderfmt = (WAVEFORMATEX *)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
-        if (!renderfmt) goto session_cleanup;
-        ZeroMemory(renderfmt, sizeof(WAVEFORMATEX));
-        renderfmt->wFormatTag      = hdr.format_tag;
-        renderfmt->nChannels       = hdr.channels;
-        renderfmt->nSamplesPerSec  = hdr.sample_rate;
-        renderfmt->wBitsPerSample  = hdr.bits_per_sample;
-        renderfmt->nBlockAlign     = hdr.block_align ? hdr.block_align
-                                     : (WORD)((hdr.channels * hdr.bits_per_sample) / 8);
-        renderfmt->nAvgBytesPerSec = renderfmt->nSamplesPerSec * renderfmt->nBlockAlign;
-        renderfmt->cbSize          = 0;
-        render_block_align         = renderfmt->nBlockAlign;
-
-        hr = IAudioClient_Initialize(pAC, AUDCLNT_SHAREMODE_SHARED,
-                                      AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
-                                      AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY |
-                                      AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                      400000, 0, renderfmt, NULL);
-        if (FAILED(hr)) {
-            idd_log(d, L"Audio: IAudioClient::Initialize failed 0x%08lX.", hr);
-            goto session_cleanup;
-        }
-
-        hr = IAudioClient_GetBufferSize(pAC, &buf_frames);
-        if (FAILED(hr)) goto session_cleanup;
-
-        hr = IAudioClient_GetService(pAC, &AUDIO_IID_IAudioRenderClient, (void **)&pRC);
-        if (FAILED(hr)) goto session_cleanup;
-
-        render_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-        if (!render_event) goto session_cleanup;
-        hr = IAudioClient_SetEventHandle(pAC, render_event);
-        if (FAILED(hr)) goto session_cleanup;
-
-        idd_log(d, L"Audio render buffer: %lu frames.", buf_frames);
-
-        /* Receive loop */
-        while (!d->stop) {
-            AudioFrameHeader fh;
-            UINT32 frames_in_payload;
-            UINT32 frame_offset = 0;
-
-            if (!recv_exact(d, s, &fh, sizeof(fh), TRUE)) break;
-            if (fh.bytes == 0 || fh.bytes > 4 * 1024 * 1024 ||
-                !render_block_align || fh.bytes % render_block_align) break;
-
-            if (fh.bytes > scratch_cap) {
-                BYTE *nb = scratch
-                    ? (BYTE *)HeapReAlloc(GetProcessHeap(), 0, scratch, fh.bytes)
-                    : (BYTE *)HeapAlloc(GetProcessHeap(), 0, fh.bytes);
-                if (!nb) break;
-                scratch = nb;
-                scratch_cap = fh.bytes;
-            }
-            if (!recv_exact(d, s, scratch, (int)fh.bytes, FALSE)) break;
-
-            /* Host-side mute: keep draining the socket but don't push to WASAPI */
-            if (d->audio_muted) continue;
-
-            frames_in_payload = fh.bytes / render_block_align;
-            if (frames_in_payload == 0) continue;
-
-            while (frame_offset < frames_in_payload && !d->stop && !d->audio_muted) {
-                UINT32 padding, free_frames, frames_to_write;
-                BYTE *dst;
-                hr = IAudioClient_GetCurrentPadding(pAC, &padding);
-                if (FAILED(hr) || padding > buf_frames) goto session_cleanup;
-                if (padding == 0 && buf_frames > 1) {
-                    UINT32 lead_frames = buf_frames / 2;
-                    hr = IAudioRenderClient_GetBuffer(pRC, lead_frames, &dst);
-                    if (FAILED(hr)) goto session_cleanup;
-                    hr = IAudioRenderClient_ReleaseBuffer(pRC, lead_frames, AUDCLNT_BUFFERFLAGS_SILENT);
-                    if (FAILED(hr)) goto session_cleanup;
-                    padding = lead_frames;
-                }
-                free_frames = buf_frames - padding;
-                if (!free_frames) {
-                    DWORD wait = WaitForSingleObject(render_event, 100);
-                    if (wait == WAIT_FAILED) goto session_cleanup;
-                    continue;
-                }
-                frames_to_write = frames_in_payload - frame_offset;
-                if (frames_to_write > free_frames) frames_to_write = free_frames;
-                hr = IAudioRenderClient_GetBuffer(pRC, frames_to_write, &dst);
-                if (FAILED(hr)) goto session_cleanup;
-                memcpy(dst, scratch + (size_t)frame_offset * render_block_align,
-                    (size_t)frames_to_write * render_block_align);
-                hr = IAudioRenderClient_ReleaseBuffer(pRC, frames_to_write, 0);
-                if (FAILED(hr)) goto session_cleanup;
-                frame_offset += frames_to_write;
-                if (!stream_started) {
-                    ResetEvent(render_event);
-                    hr = IAudioClient_Start(pAC);
-                    if (FAILED(hr)) goto session_cleanup;
-                    stream_started = TRUE;
-                }
-            }
-        }
-
-session_cleanup:
-        if (stream_started && pAC) {
-            IAudioClient_Stop(pAC);
-            stream_started = FALSE;
-        }
-        if (pRC)    { IAudioRenderClient_Release(pRC);    pRC = NULL; }
-        if (pAC)    { IAudioClient_Release(pAC);          pAC = NULL; }
-        if (render_event) { CloseHandle(render_event); render_event = NULL; }
-        if (pDev)   { IMMDevice_Release(pDev);            pDev = NULL; }
-        if (pEnum)  { IMMDeviceEnumerator_Release(pEnum); pEnum = NULL; }
-        if (renderfmt) { CoTaskMemFree(renderfmt); renderfmt = NULL; }
-
-        EnterCriticalSection(&d->frame_cs);
-        d->audio_socket = INVALID_SOCKET;
-        LeaveCriticalSection(&d->frame_cs);
-        closesocket(s);
-        if (session_logged) {
-            idd_log(d, L"Audio session ended.");
-            session_logged = FALSE;
-        }
-
-        if (d->stop) break;
-        /* Back off when the guest keeps rejecting us (VAD not ready) */
-        {
-            int wait, delay = header_misses > 3 ? 5000 : 500;
-            for (wait = 0; wait < delay && !d->stop; wait += 100)
-                Sleep(100);
-        }
-    }
-
-    if (scratch) HeapFree(GetProcessHeap(), 0, scratch);
-    if (audio_task) AvRevertMmThreadCharacteristics(audio_task);
-    if (com_ok)  CoUninitialize();
-    return 0;
-}
-
 
 /* ==================================================================
  * D3D11 initialization and teardown
@@ -2833,10 +2587,17 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
  * Recv thread - connects to VM, receives frames, updates frame_buf
  * ================================================================== */
 
-static void clip_log_callback(const wchar_t *msg, void *user_data)
+static void integration_log_callback(void *user_data, const wchar_t *msg)
 {
     VmDisplayIdd *d = (VmDisplayIdd *)user_data;
     idd_log(d, L"%s", msg);
+}
+
+/* Clipboard focus: this viewer is one focus client of the VM's clipboard coordinator. */
+static void idd_clipboard_focus(VmDisplayIdd *d, HWND hwnd)
+{
+    if (d && d->integration)
+        vm_integration_client_focus(d->integration, d->clip_client, d->input_focused && !IsIconic(hwnd));
 }
 
 static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
@@ -2876,23 +2637,6 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     while (!d->stop) {
         SOCKET s;
         FrameHeader hdr;
-
-        /* Clipboard module (handles :0005 + :0006 internally) */
-        if (!d->clipboard) {
-            d->clipboard = vm_clipboard_create(&d->runtime_id, d->os_type,
-                                               d->hwnd, clip_log_callback, d);
-            if (d->clipboard) {
-                idd_log(d, L"Clipboard module created.");
-                PostMessageW(d->hwnd, WM_IDD_CLIPBOARD_READY, 0, 0);
-            }
-        }
-
-        /* Ensure audio recv thread is running (:0004, guest→host).
-           The thread handles connecting on its own — the helper may not be up yet. */
-        if (!d->audio_recv_thread) {
-            d->audio_recv_thread = CreateThread(NULL, 0, audio_recv_thread_proc, d, 0, NULL);
-            idd_log(d, L"Audio: Started recv thread (will connect when helper is available).");
-        }
 
         /* Try to connect frame channel (VDD driver, GUID :0002) */
         idd_log(d, L"Connecting to frame service...");
@@ -3723,7 +3467,6 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     if (msg == WM_CREATE) {
         CREATESTRUCTW *cs = (CREATESTRUCTW *)lp;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
-        AddClipboardFormatListener(hwnd);
         return 0;
     }
 
@@ -3820,6 +3563,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             d->share_clipboard = !d->share_clipboard;
             CheckMenuItem(sysmenu, IDM_SHARE_CLIPBOARD,
                           MF_BYCOMMAND | (d->share_clipboard ? MF_CHECKED : MF_UNCHECKED));
+            vm_integration_set_clipboard_sharing(d->integration, d->share_clipboard);
             SendMessageW(hwnd, WM_IDD_CLIPBOARD_READY, 0, 0);
             if (FAILED(asb_vm_set_display_clipboard((AsbVm)asb_find_vm_by_id(d->vm_id), d->share_clipboard)))
                 idd_log(d, L"Could not save viewer settings.");
@@ -3843,6 +3587,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
             wchar_t title[300];
             d->audio_muted = !d->audio_muted;
+            vm_integration_set_audio_muted(d->integration, d->audio_muted);   /* VM-wide */
             if (sysmenu) {
                 CheckMenuItem(sysmenu, IDM_AUDIO_MUTE,
                               MF_BYCOMMAND | (d->audio_muted ? MF_CHECKED : MF_UNCHECKED));
@@ -3899,8 +3644,6 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             BOOL user_initiated = d->open;
 
-            RemoveClipboardFormatListener(hwnd);
-
             /* Remove the hotkey hook and release any keys still held in the
                guest before tearing the window down. */
             idd_remove_kbd_hook(d);
@@ -3920,8 +3663,6 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             EnterCriticalSection(&d->frame_cs);
             if (d->frame_socket != INVALID_SOCKET)
                 shutdown(d->frame_socket, SD_BOTH);
-            if (d->audio_socket != INVALID_SOCKET)
-                shutdown(d->audio_socket, SD_BOTH);
             LeaveCriticalSection(&d->frame_cs);
             if (d->recv_thread) {
                 idd_join_thread(d->recv_thread);
@@ -3929,17 +3670,13 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 d->recv_thread = NULL;
             }
 
-            /* Destroy clipboard module */
-            if (d->clipboard) {
-                vm_clipboard_destroy(d->clipboard);
-                d->clipboard = NULL;
-            }
-
-            /* Wait for audio recv thread (:0004) */
-            if (d->audio_recv_thread) {
-                idd_join_thread(d->audio_recv_thread);
-                CloseHandle(d->audio_recv_thread);
-                d->audio_recv_thread = NULL;
+            /* Leave the VM's clipboard/audio to their other holders (Remote Windows). */
+            if (d->integration) {
+                vm_integration_set_log(d->integration, NULL, NULL);
+                vm_integration_client_remove(d->integration, d->clip_client);
+                vm_integration_release(d->integration);
+                d->integration = NULL;
+                d->clip_client = 0;
             }
 
             d->open = FALSE;
@@ -4141,6 +3878,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) idd_request_render(d, FALSE);
         return 0;
 
+    case WM_IDD_LOG:
+        if (d && !d->stop) idd_log_append(d, (const wchar_t *)lp);
+        free((void *)lp);
+        return 0;
+
     case WM_IDD_TITLE_CHANGED:
         if (d) {
             wchar_t title[300];
@@ -4152,17 +3894,6 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
 
-    case WM_CLIPBOARDUPDATE:
-        if (d && d->clipboard) {
-            vm_clipboard_on_clipboard_update(d->clipboard);
-        }
-        return 0;
-
-    case WM_CLIP_READER_APPLY:
-        if (d && d->clipboard) {
-            vm_clipboard_on_reader_apply(d->clipboard);
-        }
-        return 0;
 
     /* Posted by vm_display_idd_focus() from another thread to raise an
        already-open window. Runs on the window's own thread. Restores from
@@ -4214,10 +3945,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_IDD_CLIPBOARD_READY:
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
-        if (d && d->clipboard) {
-            vm_clipboard_set_sharing_enabled(d->clipboard, d->share_clipboard);
-            vm_clipboard_set_sync_enabled(d->clipboard, d->share_clipboard && d->input_focused && !IsIconic(hwnd));
-        }
+        idd_clipboard_focus(d, hwnd);
         break;
 
     /* Top-level activation gates keyboard forwarding. Tracking activation
@@ -4228,8 +3956,15 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ACTIVATE:
         if (d) {
             d->input_focused = (LOWORD(wp) != WA_INACTIVE);
-            if (d->clipboard)
-                vm_clipboard_set_sync_enabled(d->clipboard, d->share_clipboard && d->input_focused && !IsIconic(hwnd));
+            idd_clipboard_focus(d, hwnd);
+            if (d->input_focused) {
+                /* The viewer becomes the VM's current user input source: whatever a shared
+                   window held is released, and shared windows give up the guest foreground
+                   before keys typed here are delivered (eh6.7). */
+                AcquireSRWLockExclusive(&d->input_lock);
+                if (d->input) asb_input_focus(d->input, ASB_INPUT_SOURCE_VIEWER, FALSE);
+                ReleaseSRWLockExclusive(&d->input_lock);
+            }
             if (!d->input_focused) {
                 agent_overlay_cancel_input(d->agent_overlay);
                 idd_flush_held_keys(d);
@@ -4436,11 +4171,9 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     InitializeSRWLock(&d->input_lock);
     d->keyboard_version   = 1;
     d->input_socket       = INVALID_SOCKET;
-    d->audio_socket       = INVALID_SOCKET;
     d->frame_socket       = INVALID_SOCKET;
     d->shared_front       = -1;
     d->shared_pending     = -1;
-    d->clipboard          = NULL;
     d->cursor_visible     = TRUE;
     d->agent_control = d->agent_x = d->agent_y = -1;
     d->agent_finished = TRUE;
@@ -4461,10 +4194,23 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     InitializeCriticalSection(&d->frame_cs);
     InitializeConditionVariable(&d->gpu_refresh_done);
 
+    /* The VM's clipboard coordinator and audio stream (shared with Remote Windows). */
+    d->integration = vm_integration_acquire(d->vm_id, &d->runtime_id, d->os_type, d->vm_name);
+    if (d->integration) {
+        d->clip_client = vm_integration_client_add(d->integration);
+        vm_integration_set_clipboard_sharing(d->integration, d->share_clipboard);
+        vm_integration_set_log(d->integration, integration_log_callback, d);
+        d->audio_muted = vm_integration_audio_muted(d->integration);
+    }
+
     /* Start the window thread (which will then start the recv thread) */
     d->window_thread = CreateThread(NULL, 0, idd_window_thread_proc, d, 0, NULL);
     if (!d->window_thread) {
         ui_log(L"IDD: Failed to create window thread.");
+        if (d->integration) {
+            vm_integration_set_log(d->integration, NULL, NULL);
+            vm_integration_release(d->integration);
+        }
         DeleteCriticalSection(&d->frame_cs);
         HeapFree(GetProcessHeap(), 0, d->frame_buf);
         HeapFree(GetProcessHeap(), 0, d);
@@ -4486,8 +4232,6 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     EnterCriticalSection(&display->frame_cs);
     if (display->frame_socket != INVALID_SOCKET)
         shutdown(display->frame_socket, SD_BOTH);
-    if (display->audio_socket != INVALID_SOCKET)
-        shutdown(display->audio_socket, SD_BOTH);
     LeaveCriticalSection(&display->frame_cs);
 
     /* Close the window to unblock the message pump */
@@ -4506,24 +4250,15 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
         CloseHandle(display->recv_thread);
     }
 
-    /* Clipboard is cleaned up by WM_CLOSE handler, but guard */
-    if (display->clipboard) {
-        vm_clipboard_destroy(display->clipboard);
-        display->clipboard = NULL;
-    }
-
-    /* audio_recv_thread guard */
-    if (display->audio_recv_thread) {
-        idd_join_thread(display->audio_recv_thread);
-        CloseHandle(display->audio_recv_thread);
+    /* The integration reference is dropped by WM_CLOSE, but guard */
+    if (display->integration) {
+        vm_integration_set_log(display->integration, NULL, NULL);
+        vm_integration_client_remove(display->integration, display->clip_client);
+        vm_integration_release(display->integration);
+        display->integration = NULL;
     }
 
     DeleteCriticalSection(&display->frame_cs);
-
-    if (display->clipboard) {
-        vm_clipboard_destroy(display->clipboard);
-        display->clipboard = NULL;
-    }
 
     if (display->frame_buf)
         HeapFree(GetProcessHeap(), 0, display->frame_buf);

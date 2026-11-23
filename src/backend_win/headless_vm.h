@@ -33,6 +33,19 @@ ASB_API DWORD asb_input_barrier(AsbInputSession *session,UINT32 generation,DWORD
 ASB_API DWORD asb_input_begin_batch(AsbInputSession *session);
 ASB_API void asb_input_end_batch(AsbInputSession *session);
 ASB_API void asb_input_context(AsbVmId id,AsbInputStatus *context);
+/* User sources (AppSandbox-eh6.7; see input_router.h). */
+typedef void (*AsbInputWatch)(void *context);
+typedef struct {
+    UINT32 source,epoch,hold,user_owns,connected,mouse_version,keyboard_version;
+} AsbInputUserState;
+ASB_API UINT32 asb_input_focus(AsbInputSession *session,UINT32 source,BOOL renew);
+ASB_API DWORD asb_input_send_user(AsbInputSession *session,UINT32 source,UINT32 epoch,const InputPacket *packet);
+ASB_API void asb_input_guard(AsbInputSession *session,UINT32 source,BOOL on);
+ASB_API UINT32 asb_input_hold(AsbInputSession *session);
+ASB_API void asb_input_unhold(AsbInputSession *session,UINT32 hold,BOOL ok);
+/* One watcher per session (NULL removes); called on any thread, must only post a message. */
+ASB_API void asb_input_watch(AsbInputSession *session,AsbInputWatch watch,void *context);
+ASB_API void asb_input_user_state(AsbInputSession *session,AsbInputUserState *state);
 ASB_API void asb_headless_forget(AsbVmId id);
 ASB_API void asb_headless_shutdown(void);
 ASB_API DWORD asb_capture(const AsbHeadlessTarget *target,DWORD timeout,AsbCapture *capture);

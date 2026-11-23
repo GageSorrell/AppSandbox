@@ -17,6 +17,9 @@
 #include "vm_display.h"
 #include "vm_display_idd.h"
 #include "vm_agent.h"
+#include "remote_windows_host.h"
+#include "remote_windows_proxy.h"
+#include "../../tools/agent/remote_windows_flyout.h"
 #include "webview2_bridge.h"
 #include "display_capabilities_json.h"
 #include "display_resolution_command.h"
@@ -69,6 +72,8 @@ static int g_command_depth;
 #define WM_VM_REMOVED          (WM_APP + 16)
 #define WM_WEBVIEW2_LOG        (WM_APP + 10)
 #define WM_TRAYICON            (WM_APP + 11)
+#define WM_RW_SELECTOR         (WM_APP + 40)   /* Remote Windows selector state changed (eh6.8) */
+#define TIMER_TRAY_CLICK       0x7E01           /* deferred single left click on the tray icon */
 #define WM_SHOW_ALERT          (WM_APP + 15)
 #define WM_VM_SHUTDOWN_TIMEOUT (WM_APP + 9)
 #define WM_PREREQ_DONE        (WM_APP + 17)
@@ -156,6 +161,243 @@ static void reconcile_displays(void)
     memcpy(g_displays, rdp, sizeof(rdp));
     memcpy(g_idd_displays, idd, sizeof(idd));
     memcpy(g_display_vm_ids, ids, sizeof(ids));
+}
+
+/* ---- Remote Windows (AppSandbox-eh6.6, eh6.7) ----
+   One sharing host per running Windows guest (manager + the VM's input arbitration, clipboard
+   coordinator and audio). Owned here, independent of the desktop viewer windows: closing a viewer
+   leaves sharing, clipboard and audio active; VM stop or app exit stops the host, which closes the
+   control channel so the guest restores every shared window. */
+static AsbRwHost *g_rw_managers[ASB_MAX_VMS];
+static UINT64 g_rw_vm_ids[ASB_MAX_VMS];
+
+static void rw_log(void *ctx, const char *message)
+{
+    (void)ctx;
+    ui_log(L"Remote Windows: %hs", message);
+}
+
+/* Any thread: the selector refreshes on the UI thread (coalesced). */
+static volatile LONG g_rw_selector_posted;
+static void rw_changed(void *ctx)
+{
+    (void)ctx;
+    if (g_hwnd_main && !InterlockedExchange(&g_rw_selector_posted, 1))
+        PostMessageW(g_hwnd_main, WM_RW_SELECTOR, 0, 0);
+}
+
+static DWORD WINAPI rw_stop_thread(LPVOID host)
+{
+    asb_rw_host_stop((AsbRwHost *)host);   /* joins the manager's connection thread (bounded connect timeout) */
+    return 0;
+}
+
+static BOOL rw_wanted(const VmInstance *vm)
+{
+    static const GUID zero = { 0, 0, 0, { 0 } };
+    return vm && vm->running && !vm->is_template && hcs_guest_has_remote_windows(vm->os_type) &&
+           memcmp(&vm->runtime_id, &zero, sizeof(zero)) != 0;
+}
+
+static void reconcile_remote_windows(void)
+{
+    int i, k;
+    for (i = 0; i < ASB_MAX_VMS; ++i) {
+        HANDLE t;
+        if (!g_rw_managers[i] || rw_wanted(asb_find_vm_by_id(g_rw_vm_ids[i]))) continue;
+        t = CreateThread(NULL, 0, rw_stop_thread, g_rw_managers[i], 0, NULL);
+        if (t) CloseHandle(t);
+        else asb_rw_host_stop(g_rw_managers[i]);
+        g_rw_managers[i] = NULL;
+        g_rw_vm_ids[i] = 0;
+    }
+    for (i = 0; i < asb_vm_count(); ++i) {
+        VmInstance *vm = asb_vm_instance(asb_vm_get(i));
+        int free_slot = -1, found = 0;
+        AsbRwHostConfig config;
+        if (!rw_wanted(vm)) continue;
+        for (k = 0; k < ASB_MAX_VMS; ++k) {
+            if (g_rw_managers[k] && g_rw_vm_ids[k] == vm->unique_id) found = 1;
+            if (!g_rw_managers[k] && free_slot < 0) free_slot = k;
+        }
+        if (found || free_slot < 0) continue;
+        ZeroMemory(&config, sizeof(config));
+        config.vm_id = vm->unique_id;
+        config.runtime = vm->runtime_id;
+        config.name = vm->name;
+        config.os_type = vm->os_type;
+        config.log = rw_log;
+        config.changed = rw_changed;
+        g_rw_managers[free_slot] = asb_rw_host_start(&config);
+        if (g_rw_managers[free_slot]) g_rw_vm_ids[free_slot] = vm->unique_id;
+        else ui_log(L"Remote Windows: sharing manager for \"%s\" could not start.", vm->name);
+    }
+}
+
+static void stop_remote_windows(void)
+{
+    int i;
+    for (i = 0; i < ASB_MAX_VMS; ++i) {
+        if (!g_rw_managers[i]) continue;
+        asb_rw_host_stop(g_rw_managers[i]);
+        g_rw_managers[i] = NULL;
+        g_rw_vm_ids[i] = 0;
+    }
+}
+
+/* ---- Remote Windows selector (AppSandbox-eh6.8) ----
+   Tray left click opens the shared flyout (remote_windows_flyout.c) for the sole running Windows
+   guest. Rows come from the manager's acknowledged inventory/selection state; toggles go through
+   asb_rw_manager_select, exactly like the guest's own flyout does through the host. */
+static AsbRwFlyout *g_selector;
+static AsbRwTrayClicks g_tray_clicks;
+static UINT g_taskbar_created;
+static uint64_t g_selector_hash;
+typedef struct { uint64_t id; uint32_t error; } RwSelectorError;
+static RwSelectorError g_selector_errors[16];   /* host-side refusals, shown until the row changes */
+
+static int rw_sole_host(void)
+{
+    int found = -1, i;
+    for (i = 0; i < ASB_MAX_VMS; ++i) {
+        if (!g_rw_managers[i]) continue;
+        if (found >= 0) return -2;
+        found = i;
+    }
+    return found;
+}
+
+static uint64_t rw_selector_hash(const AsbRwFlyoutModel *m)
+{
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t *b;
+    size_t k;
+    uint32_t i;
+#define RW_MIX(p, n) for (b = (const uint8_t *)(p), k = 0; k < (n); ++k) { h ^= b[k]; h *= 1099511628211ull; }
+    RW_MIX(&m->status, sizeof(m->status));
+    RW_MIX(m->heading, wcslen(m->heading) * sizeof(wchar_t));
+    RW_MIX(m->message, wcslen(m->message) * sizeof(wchar_t));
+    RW_MIX(&m->count, sizeof(m->count));
+    for (i = 0; i < m->count; ++i) {
+        const AsbRwFlyoutItem *it = &m->items[i];
+        uint8_t has_icon = it->icon != NULL;
+        RW_MIX(&it->id, sizeof(it->id));
+        RW_MIX(&it->state, sizeof(it->state));
+        RW_MIX(&it->error, sizeof(it->error));
+        RW_MIX(&has_icon, 1);
+        RW_MIX(it->label, wcslen(it->label) * sizeof(wchar_t));
+    }
+#undef RW_MIX
+    return h;
+}
+
+/* Builds the model; icons are copies the caller destroys (rw_selector_free_icons). */
+static void rw_selector_model(AsbRwFlyoutModel *m)
+{
+    static AsbRwManagerEntry entries[ASB_RW_MAX_INVENTORY];
+    static AsbRwInventoryEntry inv[ASB_RW_MAX_INVENTORY];
+    static uint32_t states[ASB_RW_MAX_INVENTORY], errors[ASB_RW_MAX_INVENTORY];
+    int slot = rw_sole_host();
+    uint32_t i, k, n;
+    memset(m, 0, offsetof(AsbRwFlyoutModel, items));
+    wcscpy_s(m->heading, ARRAYSIZE(m->heading), L"Show guest windows on this PC");
+    if (slot == -1) { m->status = ASB_RW_FLYOUT_NO_GUEST; return; }
+    if (slot == -2) { m->status = ASB_RW_FLYOUT_MULTIPLE; return; }
+    {
+        VmInstance *vm = asb_find_vm_by_id(g_rw_vm_ids[slot]);
+        if (vm) swprintf_s(m->heading, ARRAYSIZE(m->heading), L"Windows on %s", vm->name);
+    }
+    AsbRwManager *mgr = asb_rw_host_manager(g_rw_managers[slot]);
+    AsbRwManagerStatus st;
+    if (!mgr) { m->status = ASB_RW_FLYOUT_ERROR; return; }
+    asb_rw_manager_status(mgr, &st);
+    if (st.state == ASB_RW_MGR_DISCONNECTED || st.state == ASB_RW_MGR_CONNECTING) {
+        m->status = ASB_RW_FLYOUT_CONNECTING;
+        wcscpy_s(m->message, ARRAYSIZE(m->message), L"Waiting for the guest's App Sandbox helper…");
+        return;
+    }
+    n = asb_rw_manager_inventory(mgr, entries, ASB_RW_MAX_INVENTORY);
+    for (i = 0; i < n; ++i) {
+        inv[i] = entries[i].entry;
+        states[i] = entries[i].state;
+        errors[i] = entries[i].error;
+        for (k = 0; k < ARRAYSIZE(g_selector_errors); ++k)
+            if (g_selector_errors[k].id == inv[i].id && states[i] == ASB_RW_STATE_NONE && !errors[i]) errors[i] = g_selector_errors[k].error;
+    }
+    asb_rw_flyout_fill(m, inv, states, errors, n);
+    for (i = 0; i < m->count; ++i) m->items[i].icon = asb_rw_manager_icon(mgr, m->items[i].id);
+    if (st.state == ASB_RW_MGR_LIMITED) {
+        m->status = ASB_RW_FLYOUT_UPGRADE;
+        swprintf_s(m->message, ARRAYSIZE(m->message),
+                   L"Update the App Sandbox guest components to share windows (%hs).", asb_rw_error_text(st.negotiation_error));
+    } else {
+        m->status = ASB_RW_FLYOUT_READY;
+        wcscpy_s(m->message, ARRAYSIZE(m->message), L"Turn a window on to show it on this PC.");
+    }
+}
+
+static void rw_selector_free_icons(AsbRwFlyoutModel *m)
+{
+    uint32_t i;
+    for (i = 0; i < m->count; ++i) if (m->items[i].icon) { DestroyIcon(m->items[i].icon); m->items[i].icon = NULL; }
+}
+
+static void rw_selector_refresh(BOOL force)
+{
+    static AsbRwFlyoutModel model;
+    uint64_t h;
+    InterlockedExchange(&g_rw_selector_posted, 0);
+    if (!g_selector || (!force && !asb_rw_flyout_visible(g_selector))) return;
+    rw_selector_model(&model);
+    h = rw_selector_hash(&model);
+    if (force || h != g_selector_hash) {
+        g_selector_hash = h;
+        asb_rw_flyout_update(g_selector, &model);
+    }
+    rw_selector_free_icons(&model);
+}
+
+static void rw_selector_toggle(void *ctx, uint64_t id, int select)
+{
+    int slot = rw_sole_host();
+    uint32_t r = ASB_RW_ERR_STALE_ID, k;
+    AsbRwManager *mgr = slot >= 0 ? asb_rw_host_manager(g_rw_managers[slot]) : NULL;
+    (void)ctx;
+    if (mgr) r = asb_rw_manager_select(mgr, id, select);
+    for (k = 0; k < ARRAYSIZE(g_selector_errors); ++k) if (g_selector_errors[k].id == id) g_selector_errors[k].id = 0;
+    if (r) {
+        ui_log(L"Remote Windows: %s refused (%hs).", select ? L"select" : L"unselect", asb_rw_error_name(r));
+        for (k = 0; k < ARRAYSIZE(g_selector_errors); ++k)
+            if (!g_selector_errors[k].id) { g_selector_errors[k].id = id; g_selector_errors[k].error = r; break; }
+    }
+    rw_selector_refresh(TRUE);
+}
+
+static void rw_selector_closed(void *ctx, int deactivated)
+{
+    (void)ctx;
+    if (deactivated) asb_rw_tray_closed(&g_tray_clicks, GetTickCount64());
+}
+
+static void rw_selector_open(void)
+{
+    NOTIFYICONIDENTIFIER nii;
+    RECT anchor;
+    if (!g_selector) {
+        AsbRwFlyoutConfig fc;
+        ZeroMemory(&fc, sizeof(fc));
+        fc.toggle = rw_selector_toggle;
+        fc.closed = rw_selector_closed;
+        g_selector = asb_rw_flyout_create(&fc);
+        if (!g_selector) { ui_log(L"Remote Windows: selector could not be created."); return; }
+    }
+    if (asb_rw_flyout_visible(g_selector)) { asb_rw_flyout_hide(g_selector); return; }
+    rw_selector_refresh(TRUE);
+    ZeroMemory(&nii, sizeof(nii));
+    nii.cbSize = sizeof(nii);
+    nii.hWnd = g_nid.hWnd;
+    nii.uID = g_nid.uID;
+    asb_rw_flyout_show(g_selector, SUCCEEDED(Shell_NotifyIconGetRect(&nii, &anchor)) ? &anchor : NULL);
 }
 
 BOOL ui_command_active(void) { return g_command_depth != 0; }
@@ -854,6 +1096,9 @@ static void tray_add(HWND hwnd)
     g_nid.hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_APPSANDBOX));
     wcscpy_s(g_nid.szTip, 128, L"App Sandbox");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
+    /* eh6.8: recreate the icon when Explorer restarts (an elevated window must allow the message). */
+    if (!g_taskbar_created) g_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+    if (g_taskbar_created) ChangeWindowMessageFilterEx(hwnd, g_taskbar_created, MSGFLT_ALLOW, NULL);
 }
 
 static void tray_remove(void) { Shell_NotifyIconW(NIM_DELETE, &g_nid); }
@@ -1701,6 +1946,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_CORE_CHANGED:
         InterlockedExchange(&g_refresh_pending, 0);
+        reconcile_remote_windows();
         if (g_command_depth || asb_api_busy()) return 0;
         reconcile_displays();
         send_vm_list();
@@ -1710,6 +1956,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_VM_AGENT_STATUS:
     {
         reconcile_displays();
+        reconcile_remote_windows();
         VmInstance *inst = asb_find_vm_by_id((UINT64)lp);
         if (inst && inst->running && inst->agent_online && !inst->display_suppressed && !inst->shutdown_requested) {
             int i, count = asb_vm_count();
@@ -1872,15 +2119,41 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_TRAYICON:
         if (g_command_depth || asb_api_busy()) return 0;
-        if (lp == WM_LBUTTONDBLCLK) {
+        /* eh6.8: a single left click (deferred by the double-click time) opens the Remote Windows
+           selector; double click and the right-click menu keep their actions. */
+        switch (asb_rw_tray_event(&g_tray_clicks, (UINT)lp, GetTickCount64(), GetDoubleClickTime())) {
+        case ASB_RW_TRAY_ARM:
+            SetTimer(hwnd, TIMER_TRAY_CLICK, GetDoubleClickTime(), NULL);
+            break;
+        case ASB_RW_TRAY_DOUBLE:
+            KillTimer(hwnd, TIMER_TRAY_CLICK);
             ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
-        } else if (lp == WM_LBUTTONUP || lp == WM_RBUTTONUP) {
+            break;
+        case ASB_RW_TRAY_MENU:
+            KillTimer(hwnd, TIMER_TRAY_CLICK);
             ++g_command_depth;
             tray_show_menu(hwnd);
             --g_command_depth;
             ui_refresh_from_core();
+            break;
+        default:
+            break;
         }
+        return 0;
+
+    case WM_TIMER:
+        if (wp == TIMER_TRAY_CLICK) {
+            KillTimer(hwnd, TIMER_TRAY_CLICK);
+            if (asb_rw_tray_timer(&g_tray_clicks, GetTickCount64()) == ASB_RW_TRAY_OPEN &&
+                !g_command_depth && !asb_api_busy())
+                rw_selector_open();
+            return 0;
+        }
+        break;
+
+    case WM_RW_SELECTOR:
+        rw_selector_refresh(FALSE);
         return 0;
 
     case WM_CLOSE:
@@ -1944,6 +2217,9 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             safe_destroy_rdp(i);
             safe_destroy_idd(i);
         }
+        asb_rw_flyout_destroy(g_selector);
+        g_selector = NULL;
+        stop_remote_windows();   /* app exit ends sharing; guests restore their windows */
         asb_cleanup();
         g_hwnd_main = NULL;
         PostQuitMessage(0);
@@ -1951,5 +2227,9 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     }
 
+    if (g_taskbar_created && msg == g_taskbar_created) {   /* Explorer restarted */
+        tray_add(hwnd);
+        return 0;
+    }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }

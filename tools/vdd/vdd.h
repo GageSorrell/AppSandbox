@@ -6,8 +6,9 @@ Module Name:
 
 Abstract:
 
-    AppSandbox Virtual Display Driver - Single 1920x1080 monitor with
-    direct HvSocket frame transport to the host (no agent middleman).
+    AppSandbox Virtual Display Driver - desktop monitor with direct HvSocket
+    frame transport to the host (no agent middleman), plus an optional private
+    second monitor (Remote Windows) whose frames never leave the guest.
 
     Single fixed-resolution monitor with framebuffer readback sent directly
     over Hyper-V sockets.
@@ -38,6 +39,7 @@ Environment:
 #include "../transport/asb_transport.h"   /* AsbConn — host connection (AF_HYPERV on PC, ivshmem on Mac) */
 #include "../../src/core/protocol.h"
 #include "../transport/asb_automation.h"
+#include "../transport/asb_private_display.h"
 
 /* ============================================================================
  *  Display constants
@@ -268,6 +270,23 @@ typedef struct _VDD_SWAP_PROC {
 /* ============================================================================
  *  Device context (heap-allocated, stored via IndirectDeviceContextWrapper)
  * ============================================================================ */
+/* A host frame connection carried across a desktop swap-chain reassignment (e.g. the
+   private monitor arriving/departing re-commits modes and IddCx reassigns the desktop
+   swap chain with DXGI_ERROR_ACCESS_LOST). Only CPU-path connections without GPU
+   texture state are kept; the negotiated per-connection state travels with them. */
+typedef struct _VDD_KEPT_CLIENT {
+    AsbConn*            conn;
+    IDDCX_MONITOR       monitor;
+    ULONGLONG           tick;
+    UINT64              gpuSession;
+    BOOL                bGpuCapsSent;
+    BOOL                gpuResizeSupported;
+    BOOL                cpuResizeSupported;
+    BOOL                gpuScreenshotSupported;
+    DisplayGpuPacket    gpuControl;
+    UINT                gpuControlBytes;
+} VDD_KEPT_CLIENT;
+
 typedef struct _VDD_DEVICE_CONTEXT {
     WDFDEVICE           wdfDevice;
     IDDCX_ADAPTER       hAdapter;
@@ -303,7 +322,37 @@ typedef struct _VDD_DEVICE_CONTEXT {
        Uses a WDF timer so the callback runs on a proper WDF thread
        (IddCx APIs crash when called from raw CreateThread threads). */
     WDFTIMER            hRecoveryTimer;
+
+    /* Host frame connection kept across a desktop swap-chain reassignment (swapLock). */
+    VDD_KEPT_CLIENT     keptClient;
+
+    /* Remote Windows: explicitly leased private second monitor.
+       Its frames are drained (keeping DWM composition alive for windows parked
+       there) and are never sent on the desktop frame/screenshot channels. */
+    IDDCX_MONITOR       hPrivateMonitor;
+    GUID                privateContainerId;
+    struct _VDD_PRIVATE_SWAP* pPrivateSwap;
+    ID3D11Device*       pPrivateDevice;
+    LUID                privateDeviceLuid;
+    SRWLOCK             privateLock;
+    /* Control requests arrive via EvtIddCxDeviceIoControl, are forwarded to a manual
+       queue and drained by a work item under privateControlLock (one at a time, on a
+       WDF thread rather than the IddCx dispatch thread). */
+    WDFQUEUE            hPrivateQueue;
+    WDFWORKITEM         hPrivateWork;
+    SRWLOCK             privateControlLock;
+    UINT64              privateToken; /* privateControlLock only */
+    UINT32              privateState, privateWidth, privateHeight;
 } VDD_DEVICE_CONTEXT;
+
+typedef struct _VDD_PRIVATE_SWAP {
+    IDDCX_SWAPCHAIN     hSwapChain;
+    HANDLE              hAvailableEvent;
+    HANDLE              hTerminateEvent;
+    HANDLE              hThread;
+    ID3D11Device*       pDevice;            /* non-owning; cached in ctx->pPrivateDevice */
+    volatile LONG64     frames;
+} VDD_PRIVATE_SWAP;
 
 /* ============================================================================
  *  WDF Context Wrappers
@@ -322,6 +371,7 @@ struct MonitorContextWrapper
     ResolutionEntry modes[VDD_MAX_MODES];
     UINT modeCount;
     BOOL matchWindow;
+    BOOL isPrivate;
 };
 
 WDF_DECLARE_CONTEXT_TYPE(MonitorContextWrapper);

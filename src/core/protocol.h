@@ -21,7 +21,9 @@
 #define INPUT_UNICODE          12
 #define INPUT_MOUSE_VERSION   1
 #define INPUT_MOUSE_NORMALIZED_VERSION 2
+#define INPUT_MOUSE_VIRTUAL_VERSION 3
 #define INPUT_MOUSE_NORMALIZED 1u
+#define INPUT_MOUSE_VIRTUAL    2u
 #define INPUT_MOUSE_ABSOLUTE_MAX 65535u
 
 #define INPUT_BTN_LEFT        0
@@ -42,6 +44,10 @@
  * POSITION_QUERY: param1 = request ID, param2/param3 = 0.
  * POSITION_REPLY: param1/param2 = physical guest-screen X/Y, param3 = request ID.
  * Both coordinates are INT32_MIN if the cursor position cannot be read.
+ * MOUSE_MOVE with param3 = MOUSE_VIRTUAL (mouse version 3, Windows guests): param1/param2 are
+ * signed int32 guest virtual-screen physical pixels (any monitor, including the Remote Windows
+ * private display), mapped with asb_input_virtual_normalize. Hosts ask for version 3 in every
+ * MOUSE_QUERY (including ownership barriers), so the reply never downgrades the session.
  */
 #pragma pack(push, 1)
 typedef struct {
@@ -52,6 +58,24 @@ typedef struct {
     uint32_t param3;
 } InputPacket;
 #pragma pack(pop)
+
+/* Guest virtual-screen pixel (x, y) -> SendInput MOUSEEVENTF_VIRTUALDESK coordinates (0..65535)
+ * for a virtual screen at (vx, vy) of vw x vh physical pixels. Points outside are clamped to the
+ * nearest edge. Rounds to the nearest representable position; the injector corrects a residual
+ * one-pixel error afterwards with SetPhysicalCursorPos. */
+static inline void asb_input_virtual_normalize(int32_t x, int32_t y, int32_t vx, int32_t vy,
+                                               int32_t vw, int32_t vh, uint32_t *nx, uint32_t *ny)
+{
+    int64_t dx = (int64_t)x - vx, dy = (int64_t)y - vy;
+    if (vw < 2) vw = 2;
+    if (vh < 2) vh = 2;
+    if (dx < 0) dx = 0;
+    if (dy < 0) dy = 0;
+    if (dx > vw - 1) dx = vw - 1;
+    if (dy > vh - 1) dy = vh - 1;
+    *nx = (uint32_t)((dx * INPUT_MOUSE_ABSOLUTE_MAX + (vw - 1) / 2) / (vw - 1));
+    *ny = (uint32_t)((dy * INPUT_MOUSE_ABSOLUTE_MAX + (vh - 1) / 2) / (vh - 1));
+}
 
 #define DISPLAY_GPU_MAGIC     0x50475341u
 #define DISPLAY_GPU_VERSION   3

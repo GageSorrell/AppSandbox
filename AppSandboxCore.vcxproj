@@ -196,6 +196,8 @@
     <ClCompile Include="src\backend_win\vm_clipboard.c" />
     <ClCompile Include="src\backend_win\clipboard_file.c" />
     <ClCompile Include="tools\transport\asb_clipboard_temp.c" />
+    <ClCompile Include="src\backend_win\hcs_services.c" />
+    <ClCompile Include="tools\transport\asb_remote_windows.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\backend_win\display_settings.h" />
@@ -229,6 +231,8 @@
     <ClInclude Include="src\backend_win\vm_clipboard.h" />
     <ClInclude Include="src\backend_win\clipboard_file.h" />
     <ClInclude Include="tools\transport\asb_clipboard_temp.h" />
+    <ClInclude Include="src\backend_win\hcs_services.h" />
+    <ClInclude Include="tools\transport\asb_remote_windows.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

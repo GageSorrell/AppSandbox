@@ -1,0 +1,166 @@
+  [manager] manager: started
+  [manager] manager: control channel connected (generation 1)
+  [manager] session: guest helper 00010100 caps 0000006f -> upgrade_required, proxies on (missing 00000000)
+  [manager] manager: frame channel connected
+  [manager] frames: connected, guest pid 10688 adapter 1414:008c, CPU frames, 3 slot(s), 134217728 CPU bytes
+manager state 2, guest helper 00010100 caps 0000006f missing 00000000 (upgrade_required)
+guest windows (7):
+  08b3f48700100001  eh6.6 custom                              remote-windows-proxy-test-app
+  08b3f48700200001  eh6.6 standard                            remote-windows-proxy-test-app
+  08b3f48700300001  *xa5.3 - Notepad                          Notepad
+  08b3f48700400001  Windows PowerShell 5.1                    Windows Terminal Host
+  08b3f48700500001  Beads Issues - MineCraft (Workspace) - Visual Studio Code  Visual Studio Code
+  08b3f48700600001  Beads Issues - Bedform (Workspace) - Visual Studio Code  Visual Studio Code
+  08b3f48700700001  PowerShell                                Windows Terminal Host
+select "eh6.6 standard" -> 08b3f48700200001: ok
+select "eh6.6 custom" -> 08b3f48700100001: ok
+select "Notepad" -> 08b3f48700300001: ok
+  [manager] proxy 08b3f48700200001 created (626x413)
+  [manager] proxy 08b3f48700100001 created (546x373)
+  [manager] proxy 08b3f48700300001 created (790x635)
+ok   proxy for 08b3f48700200001 exists with frames
+  proxy hwnd 00000000001D14A6 "eh6.6 standard" client 784x517 content 784x517 frames 23 popups 0
+ok     shell entry (unowned, APPWINDOW)
+ok     guest title
+ok     no host caption (client top == visible top)
+ok     client == guest visible frame
+ok   proxy for 08b3f48700100001 exists with frames
+  proxy hwnd 00000000006E0534 "eh6.6 custom" client 546x373 content 546x373 frames 6 popups 0
+ok     shell entry (unowned, APPWINDOW)
+ok     guest title
+ok     no host caption (client top == visible top)
+ok     client == guest visible frame
+ok   proxy for 08b3f48700300001 exists with frames
+  proxy hwnd 0000000000310EA4 "*xa5.3 - Notepad" client 790x635 content 0x0 frames 3 popups 0
+ok     shell entry (unowned, APPWINDOW)
+ok     guest title
+ok     no host caption (client top == visible top)
+FAIL   client == guest visible frame
+interactive for 150 s (Ctrl+C ends; sharing ends and the guest restores its windows)
+status: state 2 frames 1 gpu 0 proxies 3 presented 32
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 23 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 3 content 0x0 flags 00 popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 112
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 99 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 7 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 192
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 179 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 7 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 272
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 259 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 7 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 356
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 339 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 436
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 419 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 517
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 500 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 596
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 579 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 676
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 659 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 757
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 740 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 838
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 821 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 918
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 901 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 997
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 980 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 1077
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 1060 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 1157
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 1140 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 1228
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 1211 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 1316
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 1299 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 1395
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 1378 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 1474
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 1457 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 11 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 1627
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 1537 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 84 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 1699
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 1609 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 84 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 1779
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 1689 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 84 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 1859
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 1769 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 84 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 1938
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 1848 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 84 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 2016
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 1926 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 84 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 2096
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 2006 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 84 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 2176
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 2086 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 84 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 2263
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 2173 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 84 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 2342
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 2252 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 84 content 786x633 flags 1e popups 0
+status: state 2 frames 1 gpu 0 proxies 3 presented 2423
+  08b3f48700100001 frames 6 content 546x373 flags 1e popups 0
+  08b3f48700200001 frames 2333 content 784x517 flags 1e popups 0
+  08b3f48700300001 frames 84 content 786x633 flags 1e popups 0
+  [manager] manager: control channel closed
+  [manager] frames: closed (ok)
+  [manager] proxy 08b3f48700200001 destroyed (ok)
+  [manager] proxy 08b3f48700100001 destroyed (ok)
+  [manager] proxy 08b3f48700300001 destroyed (ok)
+  [manager] manager: stopped
+RESULT FAIL (1 failure(s))

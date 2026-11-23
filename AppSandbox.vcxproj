@@ -207,6 +207,18 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClCompile Include="src\backend_win\vm_display_idd.c" />
     <ClCompile Include="src\backend_win\agent_overlay.c" />
     <ClCompile Include="src\backend_win\gpu_broker.c" />
+    <ClCompile Include="src\backend_win\remote_windows_frames_host.c" />
+    <ClCompile Include="src\backend_win\remote_windows_session.c" />
+    <ClCompile Include="src\backend_win\remote_windows_host.c" />
+    <ClCompile Include="src\backend_win\vm_integration.c" />
+    <ClCompile Include="tools\agent\remote_windows_flyout.c" />
+    <ClCompile Include="src\backend_win\remote_windows_proxy.cpp">
+      <CompileAs>CompileAsCpp</CompileAs>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="tools\transport\asb_rw_frames.c" />
+    <ClCompile Include="tools\transport\asb_remote_windows.c" />
     <ClCompile Include="src\app_win\webview2_bridge.c" />
     <ClCompile Include="src\app_win\headless.c" />
     <ClCompile Include="src\core\api_operations.c" />
@@ -236,6 +248,13 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClInclude Include="src\backend_win\agent_overlay.h" />
     <ClInclude Include="src\backend_win\dcomp_c.h" />
     <ClInclude Include="src\backend_win\gpu_broker.h" />
+    <ClInclude Include="src\backend_win\remote_windows_frames_host.h" />
+    <ClInclude Include="src\backend_win\remote_windows_session.h" />
+    <ClInclude Include="src\backend_win\remote_windows_host.h" />
+    <ClInclude Include="src\backend_win\vm_integration.h" />
+    <ClInclude Include="tools\agent\remote_windows_flyout.h" />
+    <ClInclude Include="src\backend_win\remote_windows_proxy.h" />
+    <ClInclude Include="tools\transport\asb_rw_frames.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\app_win\appsandbox.rc" />

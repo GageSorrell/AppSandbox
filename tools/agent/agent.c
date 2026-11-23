@@ -29,8 +29,11 @@
 #include "p9copy.h"
 #include "gl_vk_provision.h"
 #include "display_settings.h"
+#include "remote_windows_display.h"
 #include "../transport/asb_transport.h"
+#include <bcrypt.h>
 
+#pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -1395,6 +1398,270 @@ static void stop_audio_monitor(void)
     }
 }
 
+/* ---- Remote Windows helper (runs as USER, :0009) ----
+   appsandbox-remote-windows.exe parks shared windows on the private display and journals how
+   to restore them. The service launches it in the active console session, retains the private
+   display lease across helper restarts, stops it gracefully (it restores every window) and,
+   when it dies or is forced to stop, runs its independent --recover mode in that session. If
+   the session has logged off (no user token), no window survives and the service removes the
+   private display itself with the retained lease. Windows (AF_HYPERV) guests only. */
+
+#define RW_EXIT_DONE    0
+#define RW_EXIT_BUSY    2   /* --recover: a live helper owns the session; nothing done */
+#define RW_EXIT_FAILED  3   /* helper could not start (e.g. channel unavailable) */
+#define RW_EXIT_USER    4   /* the user chose Exit in the guest tray; everything was restored */
+#define RW_STOP_WAIT_MS     15000
+#define RW_RECOVER_WAIT_MS  20000
+#define RW_FAIL_BACKOFF_MS  60000
+
+static CRITICAL_SECTION g_rw_cs;
+static HANDLE g_rw_process = NULL;
+static DWORD  g_rw_session = 0xFFFFFFFF;
+static HANDLE g_rw_stop = NULL;          /* inheritable manual-reset event: graceful helper exit */
+static UINT64 g_rw_lease = 0;
+static volatile BOOL g_rw_monitor_running = FALSE;
+static HANDLE g_rw_monitor_thread = NULL;
+
+static BOOL rw_exe_path(wchar_t *path)
+{
+    wchar_t *slash;
+    if (!GetModuleFileNameW(NULL, path, MAX_PATH)) return FALSE;
+    slash = wcsrchr(path, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    return wcscat_s(path, MAX_PATH, L"appsandbox-remote-windows.exe") == 0 &&
+           GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+/* Launch the helper (or --recover) as the session's user. Only the stdin pipe carrying the
+   lease and, for the helper, the stop event are inherited. *no_user: the session has no user. */
+static HANDLE rw_spawn(DWORD session_id, BOOL recover, BOOL *no_user)
+{
+    wchar_t exe[MAX_PATH], cmd[MAX_PATH + 96];
+    HANDLE token = NULL, read_end = NULL, write_end = NULL, result = NULL, inherit[2];
+    DWORD inherit_count = 0;
+    SIZE_T attr_size = 0;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+    LPVOID env = NULL;
+    STARTUPINFOEXW si;
+    PROCESS_INFORMATION pi;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+
+    *no_user = FALSE;
+    if (!rw_exe_path(exe)) return NULL;
+    if (!WTSQueryUserToken(session_id, &token)) {
+        DWORD err = GetLastError();
+        *no_user = err == ERROR_NO_TOKEN || err == ERROR_FILE_NOT_FOUND || err == ERROR_CTX_WINSTATION_NOT_FOUND;
+        return NULL;
+    }
+    if (!CreatePipe(&read_end, &write_end, &sa, 0)) goto done;
+    SetHandleInformation(write_end, HANDLE_FLAG_INHERIT, 0);
+    inherit[inherit_count++] = read_end;
+    if (recover) {
+        swprintf_s(cmd, MAX_PATH + 96, L"\"%s\" --recover", exe);
+    } else {
+        ResetEvent(g_rw_stop);
+        inherit[inherit_count++] = g_rw_stop;
+        swprintf_s(cmd, MAX_PATH + 96, L"\"%s\" --stop-event %llx", exe,
+                   (unsigned long long)(ULONG_PTR)g_rw_stop);
+    }
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_size);
+    if (!attrs || !InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size)) {
+        if (attrs) HeapFree(GetProcessHeap(), 0, attrs);
+        attrs = NULL;
+        goto done;
+    }
+    if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit,
+                                   inherit_count * sizeof(HANDLE), NULL, NULL)) goto done;
+    if (!CreateEnvironmentBlock(&env, token, FALSE)) env = NULL;
+    ZeroMemory(&si, sizeof(si));
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.lpDesktop = L"WinSta0\\Default";
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = read_end;
+    si.lpAttributeList = attrs;
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessAsUserW(token, exe, cmd, NULL, NULL, TRUE,
+                              EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW |
+                              (env ? CREATE_UNICODE_ENVIRONMENT : 0),
+                              env, NULL, &si.StartupInfo, &pi)) {
+        agent_log("Remote Windows: CreateProcessAsUserW failed (%lu).", GetLastError());
+        goto done;
+    }
+    CloseHandle(read_end);
+    read_end = NULL;
+    {
+        char text[24];
+        DWORD written = 0;
+        int n = sprintf_s(text, sizeof(text), "%016llx\n", (unsigned long long)g_rw_lease);
+        if (n > 0) WriteFile(write_end, text, (DWORD)n, &written, NULL);
+    }
+    CloseHandle(pi.hThread);
+    result = pi.hProcess;
+    agent_log("Remote Windows: %s PID %lu in session %lu.", recover ? "recovery" : "helper",
+              pi.dwProcessId, session_id);
+done:
+    if (read_end) CloseHandle(read_end);
+    if (write_end) CloseHandle(write_end);
+    if (attrs) { DeleteProcThreadAttributeList(attrs); HeapFree(GetProcessHeap(), 0, attrs); }
+    if (env) DestroyEnvironmentBlock(env);
+    CloseHandle(token);
+    return result;
+}
+
+static DWORD rw_no_sources(void *arg) { (void)arg; return ERROR_SUCCESS; }
+
+/* Only after logoff: no window of the session survives to be stranded. */
+static void rw_release_display_without_sources(void)
+{
+    AsbRwDisplay display;
+    UINT32 state = ASB_PRIVATE_ABSENT;
+    if (asb_rw_display_open(&display, g_rw_lease)) return;
+    if (!asb_rw_display_query(&display, &state, NULL, NULL) && state != ASB_PRIVATE_ABSENT)
+        agent_log("Remote Windows: private display removal after logoff -> %lu.",
+                  asb_rw_display_restore(&display, rw_no_sources, NULL));
+    asb_rw_display_close(&display);
+}
+
+/* Independent recovery in the session the helper ran in. */
+static void rw_recover(DWORD session_id)
+{
+    BOOL no_user = FALSE;
+    DWORD code = STILL_ACTIVE;
+    HANDLE proc;
+    if (session_id == 0xFFFFFFFF) return;
+    proc = rw_spawn(session_id, TRUE, &no_user);
+    if (!proc) {
+        if (no_user) rw_release_display_without_sources();
+        else agent_log("Remote Windows: recovery could not start in session %lu.", session_id);
+        return;
+    }
+    if (WaitForSingleObject(proc, RW_RECOVER_WAIT_MS) == WAIT_TIMEOUT) {
+        agent_log("Remote Windows: recovery timed out; retried on next helper start.");
+        TerminateProcess(proc, 1);
+        WaitForSingleObject(proc, 3000);
+    }
+    GetExitCodeProcess(proc, &code);
+    agent_log("Remote Windows: recovery in session %lu exited %lu.", session_id, code);
+    CloseHandle(proc);
+}
+
+/* Ask the helper to restore everything and exit; force and recover if it does not. */
+static void rw_stop_helper(BOOL recover_after)
+{
+    HANDLE proc;
+    DWORD session_id, code = STILL_ACTIVE;
+    EnterCriticalSection(&g_rw_cs);
+    proc = g_rw_process;
+    session_id = g_rw_session;
+    g_rw_process = NULL;
+    g_rw_session = 0xFFFFFFFF;
+    LeaveCriticalSection(&g_rw_cs);
+    if (!proc) return;
+    SetEvent(g_rw_stop);
+    if (WaitForSingleObject(proc, RW_STOP_WAIT_MS) == WAIT_TIMEOUT) {
+        agent_log("Remote Windows: helper did not stop in time; terminating.");
+        TerminateProcess(proc, 1);
+        WaitForSingleObject(proc, 3000);
+    }
+    GetExitCodeProcess(proc, &code);
+    CloseHandle(proc);
+    agent_log("Remote Windows: helper stopped (%lu).", code);
+    if (recover_after && code != RW_EXIT_DONE) rw_recover(session_id);
+}
+
+static DWORD WINAPI rw_monitor_thread(LPVOID param)
+{
+    ULONGLONG backoff_until = 0, started = 0;
+    DWORD last_spawn_session = 0xFFFFFFFF;
+    DWORD user_exit_session = 0xFFFFFFFF;   /* eh6.8: no restart in a session where the user chose Exit */
+    (void)param;
+    asb_transport_init();
+    if (asb_transport_is_ivshmem()) {
+        agent_log("Remote Windows monitor: not available on this transport.");
+        return 0;
+    }
+    agent_log("Remote Windows monitor: started.");
+    while (g_rw_monitor_running) {
+        DWORD current = WTSGetActiveConsoleSessionId(), session_id;
+        HANDLE proc;
+        EnterCriticalSection(&g_rw_cs);
+        proc = g_rw_process;
+        session_id = g_rw_session;
+        LeaveCriticalSection(&g_rw_cs);
+
+        if (proc && WaitForSingleObject(proc, 0) == WAIT_OBJECT_0) {
+            DWORD code = STILL_ACTIVE;
+            GetExitCodeProcess(proc, &code);
+            EnterCriticalSection(&g_rw_cs);
+            g_rw_process = NULL;
+            g_rw_session = 0xFFFFFFFF;
+            LeaveCriticalSection(&g_rw_cs);
+            CloseHandle(proc);
+            proc = NULL;
+            agent_log("Remote Windows: helper in session %lu exited (%lu).", session_id, code);
+            if (code == RW_EXIT_USER) {
+                user_exit_session = session_id;
+                agent_log("Remote Windows: the user exited the helper; not restarting it in session %lu.", session_id);
+            }
+            if (code != RW_EXIT_DONE && code != RW_EXIT_BUSY && code != RW_EXIT_USER) rw_recover(session_id);
+            if (code == RW_EXIT_FAILED && GetTickCount64() - started < 10000)
+                backoff_until = GetTickCount64() + RW_FAIL_BACKOFF_MS;
+        }
+        if (proc && current != session_id) {
+            agent_log("Remote Windows: console session %lu -> %lu.", session_id, current);
+            rw_stop_helper(TRUE);
+            proc = NULL;
+        }
+        if (current != user_exit_session) user_exit_session = 0xFFFFFFFF;   /* a new sign-in starts it again */
+        if (!proc && current != 0xFFFFFFFF && current != user_exit_session && GetTickCount64() >= backoff_until) {
+            BOOL no_user = FALSE;
+            HANDLE spawned = rw_spawn(current, FALSE, &no_user);
+            if (spawned) {
+                EnterCriticalSection(&g_rw_cs);
+                g_rw_process = spawned;
+                g_rw_session = current;
+                LeaveCriticalSection(&g_rw_cs);
+                started = GetTickCount64();
+                last_spawn_session = 0xFFFFFFFF;
+            } else if (last_spawn_session != current) {
+                last_spawn_session = current;   /* log once per session, not every retry */
+                agent_log("Remote Windows: helper not started in session %lu (%s).", current,
+                          no_user ? "no user signed in" : "unavailable");
+            }
+        }
+        for (int i = 0; i < 6 && g_rw_monitor_running; i++) Sleep(500);
+    }
+    rw_stop_helper(!g_os_shutting_down);
+    agent_log("Remote Windows monitor: stopped.");
+    return 0;
+}
+
+static void start_rw_monitor(void)
+{
+    InitializeCriticalSection(&g_rw_cs);
+    BCryptGenRandom(NULL, (PUCHAR)&g_rw_lease, sizeof(g_rw_lease), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!g_rw_lease) g_rw_lease = GetTickCount64() | 1;
+    {
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+        g_rw_stop = CreateEventW(&sa, TRUE, FALSE, NULL);
+    }
+    if (!g_rw_stop) return;
+    g_rw_monitor_running = TRUE;
+    g_rw_monitor_thread = CreateThread(NULL, 0, rw_monitor_thread, NULL, 0, NULL);
+}
+
+static void stop_rw_monitor(void)
+{
+    g_rw_monitor_running = FALSE;
+    if (g_rw_monitor_thread) {
+        /* Stopping includes the helper's own restoration and, if needed, recovery. */
+        WaitForSingleObject(g_rw_monitor_thread, RW_STOP_WAIT_MS + RW_RECOVER_WAIT_MS + 10000);
+        CloseHandle(g_rw_monitor_thread);
+        g_rw_monitor_thread = NULL;
+    }
+}
+
 /* ---- IDD driver status check ---- */
 
 /* Check the AppSandboxVDD driver state and report "idd_status:<status>" to the host
@@ -2602,6 +2869,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     /* Start audio capture monitor (SYSTEM, :0004) */
     start_audio_monitor();
 
+    /* Start Remote Windows helper monitor (user, :0009; restores windows on stop/death) */
+    start_rw_monitor();
+
     set_service_status(SERVICE_RUNNING, 0);
     agent_log("Service started.");
 
@@ -2617,6 +2887,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Clean up */
     agent_log("Stop event signaled, cleaning up...");
+    agent_log("Stopping Remote Windows monitor...");
+    stop_rw_monitor();   /* first: shared windows are restored while the private display exists */
+    agent_log("Remote Windows monitor stopped.");
     agent_log("Stopping SSH proxy...");
     stop_ssh_proxy();
     agent_log("SSH proxy stopped.");

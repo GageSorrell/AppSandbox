@@ -1,7 +1,7 @@
 {
   "database": "dolt",
   "backend": "dolt",
-  "dolt_mode": "embedded",
+  "dolt_mode": "server",
   "dolt_database": "AppSandbox",
   "project_id": "5edf1fd4-642d-4be1-9058-632d9c87bd04"
 }

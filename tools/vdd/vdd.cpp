@@ -208,6 +208,12 @@ static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig, UINT vSyn
 static UINT VddTargetResolutions(IDDCX_MONITOR monitor, ResolutionEntry* modes)
 {
     MonitorContextWrapper* context = WdfObjectGet_MonitorContextWrapper(monitor);
+    if (context->isPrivate) {
+        /* The private monitor never feeds the host desktop transport, so its modes are
+           independent of GPU/CPU desktop-transport negotiation. */
+        memcpy(modes, context->modes, context->modeCount * sizeof(*modes));
+        return context->modeCount;
+    }
     BOOL full = InterlockedCompareExchange(&context->pContext->fullModes, 0, 0) != 0;
     BOOL gpu = InterlockedCompareExchange(&context->pContext->gpuModes, 0, 0) != 0;
     UINT count = 0;
@@ -1490,7 +1496,74 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
 /*  Swap chain cleanup helper                                                */
 /* ========================================================================= */
 
-static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
+
+/* ========================================================================= */
+/*  Host frame connection continuity across desktop swap-chain reassignment   */
+/* ========================================================================= */
+
+#define VDD_KEPT_CLIENT_MS 10000
+
+/* swapLock held. */
+static void VddDropKeptClient(VDD_DEVICE_CONTEXT* ctx, const char* reason)
+{
+    if (!ctx->keptClient.conn) return;
+    VddLog("Frame: closing kept host connection (%s)", reason);
+    VddCloseConn(&ctx->keptClient.conn);
+    ZeroMemory(&ctx->keptClient, sizeof(ctx->keptClient));
+}
+
+/* Threads of proc have exited. Moves the live client connection into *keep when it can
+   continue unchanged on the next swap chain: PC socket (never the ivshmem slot), no GPU
+   I/O, texture pool or texture offers, and no newer host connection already pending. */
+static BOOL VddKeepClient(VDD_SWAP_PROC* proc, VDD_KEPT_CLIENT* keep)
+{
+    if (!keep || !proc->hClientConn || proc->hPendingConn || proc->hGpuIoConn ||
+        asb_conn_socket_u64(proc->hClientConn) == ~0ull || proc->bGpuPoolReady ||
+        proc->bGpuPoolFailed || InterlockedCompareExchange(&proc->gpuIoFailed, 0, 0))
+        return FALSE;
+    for (UINT i = 0; i < DISPLAY_GPU_SLOTS; ++i) {
+        if (proc->gpuSlots[i].pTexture || proc->gpuSlots[i].pMutex ||
+            proc->gpuSlots[i].hTexture || proc->gpuSlots[i].bOfferSeen) return FALSE;
+    }
+    ZeroMemory(keep, sizeof(*keep));
+    keep->conn = proc->hClientConn;
+    keep->monitor = proc->hMonitor;
+    keep->tick = GetTickCount64();
+    keep->gpuSession = proc->gpuSession;
+    keep->bGpuCapsSent = proc->bGpuCapsSent;
+    keep->gpuResizeSupported = proc->gpuResizeSupported;
+    keep->cpuResizeSupported = proc->cpuResizeSupported;
+    keep->gpuScreenshotSupported = proc->gpuScreenshotSupported;
+    keep->gpuControl = proc->gpuControl;
+    keep->gpuControlBytes = proc->gpuControlBytes;
+    proc->hClientConn = NULL;
+    return TRUE;
+}
+
+/* swapLock held; proc's threads not started yet. The first frame on the adopted
+   connection is a full frame (the host accepts mode/size changes mid-stream). */
+static void VddAdoptKeptClient(VDD_DEVICE_CONTEXT* ctx, VDD_SWAP_PROC* proc, IDDCX_MONITOR monitor)
+{
+    VDD_KEPT_CLIENT* keep = &ctx->keptClient;
+    if (!keep->conn) return;
+    if (keep->monitor != monitor || GetTickCount64() - keep->tick > VDD_KEPT_CLIENT_MS) {
+        VddDropKeptClient(ctx, keep->monitor != monitor ? "different monitor" : "expired");
+        return;
+    }
+    proc->hClientConn = keep->conn;
+    proc->gpuSession = keep->gpuSession;
+    proc->bGpuCapsSent = keep->bGpuCapsSent;
+    proc->gpuResizeSupported = keep->gpuResizeSupported;
+    proc->cpuResizeSupported = keep->cpuResizeSupported;
+    proc->gpuScreenshotSupported = keep->gpuScreenshotSupported;
+    proc->gpuControl = keep->gpuControl;
+    proc->gpuControlBytes = keep->gpuControlBytes;
+    VddLog("Frame: host connection kept across swap-chain reassignment (%llu ms)",
+           (unsigned long long)(GetTickCount64() - keep->tick));
+    ZeroMemory(keep, sizeof(*keep));
+}
+
+static void VddDestroySwapProc(VDD_SWAP_PROC* proc, VDD_KEPT_CLIENT* keep = NULL)
 {
     if (!proc) return;
 
@@ -1520,7 +1593,9 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
 
     asb_vdd_screenshot_destroy(&proc->screenshot);
 
-    /* Close any remaining client connection */
+    /* Close any remaining client connection, unless it continues on the next swap chain */
+    if (VddKeepClient(proc, keep))
+        VddLog("DestroySwapProc: keeping client connection for the next swap chain");
     VddLog("DestroySwapProc: closing client connection (%p)", (void*)proc->hClientConn);
     VddCloseConn(&proc->hClientConn);
     VddLog("DestroySwapProc: closing pending connection");
@@ -1567,15 +1642,23 @@ static void VddContextInit(VDD_DEVICE_CONTEXT* ctx, WDFDEVICE device)
     InitializeSRWLock(&ctx->swapLock);
     InitializeSRWLock(&ctx->displayLock);
     InitializeSRWLock(&ctx->displayWorkLock);
+    InitializeSRWLock(&ctx->privateLock);
+    InitializeSRWLock(&ctx->privateControlLock);
     HRESULT containerStatus = CoCreateGuid(&ctx->monitorContainerId);
     if (FAILED(containerStatus)) VddLog("Monitor container ID creation failed 0x%08X", containerStatus);
+    containerStatus = CoCreateGuid(&ctx->privateContainerId);
+    if (FAILED(containerStatus)) VddLog("Private monitor container ID creation failed 0x%08X", containerStatus);
 }
+
+static void VddDestroyPrivateSwap(VDD_PRIVATE_SWAP* swap);
 
 static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
 {
     VddLog("Context cleanup starting");
+    VddDropKeptClient(ctx, "stopping");
     InterlockedExchange(&ctx->stopping, 1);
     if (ctx->hDisplayWork) WdfWorkItemFlush(ctx->hDisplayWork);
+    if (ctx->hPrivateWork) WdfWorkItemFlush(ctx->hPrivateWork);
 
     /* Stop recovery timer (wait for any in-progress callback to finish) */
     if (ctx->hRecoveryTimer) {
@@ -1586,6 +1669,15 @@ static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
     {
         VddDestroySwapProc(ctx->pSwapProc);
         ctx->pSwapProc = nullptr;
+    }
+    AcquireSRWLockExclusive(&ctx->privateLock);
+    VDD_PRIVATE_SWAP* privateSwap = ctx->pPrivateSwap;
+    ctx->pPrivateSwap = nullptr;
+    ReleaseSRWLockExclusive(&ctx->privateLock);
+    VddDestroyPrivateSwap(privateSwap);
+    if (ctx->pPrivateDevice) {
+        ctx->pPrivateDevice->Release();
+        ctx->pPrivateDevice = nullptr;
     }
     if (ctx->hDisplayWork) WdfWorkItemFlush(ctx->hDisplayWork);
 
@@ -1615,7 +1707,7 @@ static void VddInitAdapter(VDD_DEVICE_CONTEXT* ctx)
     adapterCaps.Size = sizeof(adapterCaps);
     VddLog("InitAdapter: IDDCX_ADAPTER_CAPS.Size=%u", (unsigned)adapterCaps.Size);
 
-    adapterCaps.MaxMonitorsSupported = 1;
+    adapterCaps.MaxMonitorsSupported = 2;   /* desktop monitor + optional private sharing monitor */
     adapterCaps.Flags = IDDCX_ADAPTER_FLAGS_USE_SMALLEST_MODE;
 
     adapterCaps.EndPointDiagnostics.Size = sizeof(adapterCaps.EndPointDiagnostics);
@@ -1854,6 +1946,7 @@ static void VddUpdateDisplay(VDD_DEVICE_CONTEXT* ctx)
         InterlockedExchange(&ctx->reconfiguring, 1);
         ctx->hMonitor = NULL;
         ctx->pSwapProc = NULL;
+        VddDropKeptClient(ctx, "monitor recreated");
     }
     ReleaseSRWLockExclusive(&ctx->swapLock);
     if (recreate) {
@@ -1971,6 +2064,289 @@ static VOID VddRecoveryTimerCallback(WDFTIMER Timer)
 }
 
 /* ========================================================================= */
+/*  Remote Windows private monitor (explicit guest control)                        */
+/*                                                                           */
+/*  A second IddCx monitor that exists only while sharing is requested.       */
+/*  Windows composes windows parked on it normally (so Windows Graphics       */
+/*  Capture keeps receiving frames), but its swap chain is only drained:      */
+/*  nothing is read back or sent to the host desktop viewer, screenshots or   */
+/*  automation, which keep targeting the original monitor.                    */
+/* ========================================================================= */
+
+static HRESULT VddGetPrivateDevice(VDD_DEVICE_CONTEXT* ctx, LUID luid, ID3D11Device** device)
+{
+    /* Separate from the desktop monitor's cached device: the two swap chain threads never
+       share an immediate context. Cached until context cleanup (IddCx teardown safety). */
+    if (ctx->pPrivateDevice && ctx->privateDeviceLuid.HighPart == luid.HighPart &&
+        ctx->privateDeviceLuid.LowPart == luid.LowPart &&
+        ctx->pPrivateDevice->GetDeviceRemovedReason() == S_OK) {
+        *device = ctx->pPrivateDevice;
+        return S_OK;
+    }
+    if (ctx->pPrivateDevice) {
+        ctx->pPrivateDevice->Release();
+        ctx->pPrivateDevice = nullptr;
+    }
+    IDXGIFactory5* factory = nullptr;
+    IDXGIAdapter1* adapter = nullptr;
+    HRESULT hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory5), (void**)&factory);
+    if (SUCCEEDED(hr)) hr = factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter1), (void**)&adapter);
+    if (factory) factory->Release();
+    if (FAILED(hr)) return hr;
+    D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    ID3D11Device* created = nullptr;
+    hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &created, nullptr, nullptr);
+    adapter->Release();
+    if (FAILED(hr)) return hr;
+    ctx->pPrivateDevice = created;
+    ctx->privateDeviceLuid = luid;
+    *device = created;
+    return S_OK;
+}
+
+static DWORD WINAPI VddPrivateSwapThread(LPVOID parameter)
+{
+    VDD_PRIVATE_SWAP* swap = (VDD_PRIVATE_SWAP*)parameter;
+    DWORD taskIndex = 0;
+    HANDLE avrt = AvSetMmThreadCharacteristicsW(L"Distribution", &taskIndex);
+    IDXGIDevice* dxgi = nullptr;
+    HRESULT hr = swap->pDevice->QueryInterface(IID_PPV_ARGS(&dxgi));
+    if (SUCCEEDED(hr)) {
+        IDARG_IN_SWAPCHAINSETDEVICE setDevice = {};
+        setDevice.pDevice = dxgi;
+        hr = IddCxSwapChainSetDevice(swap->hSwapChain, &setDevice);
+        dxgi->Release();
+    }
+    VddLog("Private: swap chain device set hr=0x%08X", hr);
+    HANDLE waits[2] = { swap->hAvailableEvent, swap->hTerminateEvent };
+    while (SUCCEEDED(hr)) {
+        if (WaitForSingleObject(swap->hTerminateEvent, 0) == WAIT_OBJECT_0) break;
+        IDXGIResource* surface = nullptr;
+#pragma warning(suppress: 4127)
+        if (IDD_IS_FUNCTION_AVAILABLE(IddCxSwapChainReleaseAndAcquireBuffer2)) {
+            IDARG_IN_RELEASEANDACQUIREBUFFER2 in = {};
+            IDARG_OUT_RELEASEANDACQUIREBUFFER2 out = {};
+            in.Size = sizeof(in);
+            hr = IddCxSwapChainReleaseAndAcquireBuffer2(swap->hSwapChain, &in, &out);
+            surface = out.MetaData.pSurface;
+        } else {
+            IDARG_OUT_RELEASEANDACQUIREBUFFER out = {};
+            hr = IddCxSwapChainReleaseAndAcquireBuffer(swap->hSwapChain, &out);
+            surface = out.MetaData.pSurface;
+        }
+        if (hr == E_PENDING) {
+            DWORD wait = WaitForMultipleObjects(2, waits, FALSE, 100);
+            if (wait == WAIT_OBJECT_0 + 1) break;
+            hr = S_OK;
+            continue;
+        }
+        if (FAILED(hr)) break;
+        (void)surface;   /* drained only: composition stays live, pixels never leave the guest */
+        hr = IddCxSwapChainFinishedProcessingFrame(swap->hSwapChain);
+        InterlockedIncrement64(&swap->frames);
+    }
+    VddLog("Private: swap chain loop exit hr=0x%08X frames=%lld", hr, (long long)swap->frames);
+    if (swap->hSwapChain) {
+        WdfObjectDelete((WDFOBJECT)swap->hSwapChain);
+        swap->hSwapChain = NULL;
+    }
+    if (avrt) AvRevertMmThreadCharacteristics(avrt);
+    return 0;
+}
+
+static void VddDestroyPrivateSwap(VDD_PRIVATE_SWAP* swap)
+{
+    if (!swap) return;
+    if (swap->hTerminateEvent) SetEvent(swap->hTerminateEvent);
+    if (swap->hThread) {
+        WaitForSingleObject(swap->hThread, INFINITE);
+        CloseHandle(swap->hThread);
+    }
+    if (swap->hTerminateEvent) CloseHandle(swap->hTerminateEvent);
+    free(swap);
+}
+
+static NTSTATUS VddAssignPrivateSwapChain(VDD_DEVICE_CONTEXT* ctx, const IDARG_IN_SETSWAPCHAIN* args)
+{
+    VDD_PRIVATE_SWAP* swap = (VDD_PRIVATE_SWAP*)calloc(1, sizeof(*swap));
+    if (!swap) return STATUS_NO_MEMORY;
+    swap->hSwapChain = args->hSwapChain;
+    swap->hAvailableEvent = args->hNextSurfaceAvailable;
+    swap->hTerminateEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    AcquireSRWLockExclusive(&ctx->privateLock);
+    VDD_PRIVATE_SWAP* previous = ctx->pPrivateSwap;
+    ctx->pPrivateSwap = NULL;
+    ReleaseSRWLockExclusive(&ctx->privateLock);
+    VddDestroyPrivateSwap(previous);
+    HRESULT hr = swap->hTerminateEvent ? VddGetPrivateDevice(ctx, args->RenderAdapterLuid, &swap->pDevice)
+                                       : E_OUTOFMEMORY;
+    if (SUCCEEDED(hr)) {
+        swap->hThread = CreateThread(NULL, 0, VddPrivateSwapThread, swap, 0, NULL);
+        if (!swap->hThread) hr = HRESULT_FROM_WIN32(GetLastError());
+    }
+    if (FAILED(hr)) {
+        VddLog("Private: AssignSwapChain failed hr=0x%08X", hr);
+        if (swap->hTerminateEvent) CloseHandle(swap->hTerminateEvent);
+        free(swap);
+        return (NTSTATUS)0xC01E0012L; /* STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN */
+    }
+    AcquireSRWLockExclusive(&ctx->privateLock);
+    ctx->pPrivateSwap = swap;
+    ReleaseSRWLockExclusive(&ctx->privateLock);
+    VddLog("Private: swap chain assigned");
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS VddCreatePrivateMonitor(VDD_DEVICE_CONTEXT* ctx, UINT width, UINT height)
+{
+    ResolutionEntry modes[VDD_MAX_MODES] = {};
+    UINT modeCount = 1;
+    modes[0] = { width, height, 60 };
+    BYTE edid[VDD_EDID_BYTES];
+    UINT edidBytes = VddBuildEdid(edid, modes, modeCount);
+    /* Distinct PnP identity (ASB0002, serial 2) while keeping the "AppSandboxVDD" name so the
+       guest display watcher's AppSandbox-only filter keeps it active. */
+    edid[10] = 0x02;
+    edid[12] = 0x02;
+    VddChecksum(edid, 128);
+
+    IDDCX_MONITOR_INFO info = {};
+    info.Size = sizeof(info);
+    info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL;
+    info.ConnectorIndex = 1;
+    info.MonitorDescription.Size = sizeof(info.MonitorDescription);
+    info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
+    info.MonitorDescription.DataSize = edidBytes;
+    info.MonitorDescription.pData = edid;
+    info.MonitorContainerId = ctx->privateContainerId;
+
+    WDF_OBJECT_ATTRIBUTES attrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attrs, MonitorContextWrapper);
+    IDARG_IN_MONITORCREATE in = {};
+    in.ObjectAttributes = &attrs;
+    in.pMonitorInfo = &info;
+    IDARG_OUT_MONITORCREATE out = {};
+    NTSTATUS st = IddCxMonitorCreate(ctx->hAdapter, &in, &out);
+    if (!NT_SUCCESS(st)) {
+        VddLog("Private: IddCxMonitorCreate failed 0x%08X", st);
+        return st;
+    }
+    MonitorContextWrapper* mon = WdfObjectGet_MonitorContextWrapper(out.MonitorObject);
+    mon->pContext = ctx;
+    mon->modeCount = modeCount;
+    mon->matchWindow = FALSE;
+    mon->isPrivate = TRUE;
+    memcpy(mon->modes, modes, modeCount * sizeof(*modes));
+    AcquireSRWLockExclusive(&ctx->privateLock);
+    ctx->hPrivateMonitor = out.MonitorObject;
+    ReleaseSRWLockExclusive(&ctx->privateLock);
+    IDARG_OUT_MONITORARRIVAL arrival = {};
+    st = IddCxMonitorArrival(out.MonitorObject, &arrival);
+    if (!NT_SUCCESS(st)) {
+        VddLog("Private: IddCxMonitorArrival failed 0x%08X", st);
+        AcquireSRWLockExclusive(&ctx->privateLock);
+        ctx->hPrivateMonitor = NULL;
+        ReleaseSRWLockExclusive(&ctx->privateLock);
+        WdfObjectDelete(out.MonitorObject);
+        return st;
+    }
+    VddLog("Private: monitor arrived %ux%u", width, height);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS VddRemovePrivateMonitor(VDD_DEVICE_CONTEXT* ctx)
+{
+    AcquireSRWLockShared(&ctx->privateLock);
+    IDDCX_MONITOR monitor = ctx->hPrivateMonitor;
+    ReleaseSRWLockShared(&ctx->privateLock);
+    if (!monitor) return STATUS_SUCCESS;
+    /* IddCx invokes UnassignSwapChain on departure. Do not discard the live
+       handle/state on failure: recovery must be able to retry removal. */
+    NTSTATUS st = IddCxMonitorDeparture(monitor);
+    if (NT_SUCCESS(st)) {
+        AcquireSRWLockExclusive(&ctx->privateLock);
+        ctx->hPrivateMonitor = NULL;
+        VDD_PRIVATE_SWAP* swap = ctx->pPrivateSwap;
+        ctx->pPrivateSwap = NULL;
+        ReleaseSRWLockExclusive(&ctx->privateLock);
+        VddDestroyPrivateSwap(swap);
+    }
+    return st;
+}
+
+#include "private_control.inl"
+
+static void VddPrivateRequest(VDD_DEVICE_CONTEXT* ctx, WDFREQUEST request)
+{
+    WDF_REQUEST_PARAMETERS params;
+    WDF_REQUEST_PARAMETERS_INIT(&params);
+    WdfRequestGetParameters(request, &params);
+    size_t inputLength = params.Parameters.DeviceIoControl.InputBufferLength;
+    size_t outputLength = params.Parameters.DeviceIoControl.OutputBufferLength;
+    AsbPrivateDisplayRequest* input = NULL;
+    AsbPrivateDisplayReply* output = NULL;
+    if (params.Type != WdfRequestTypeDeviceControl ||
+        params.Parameters.DeviceIoControl.IoControlCode != ASB_PRIVATE_IOCTL) {
+        WdfRequestComplete(request, STATUS_INVALID_DEVICE_REQUEST);
+        return;
+    }
+    if (inputLength != sizeof(*input) || outputLength < sizeof(*output)) {
+        WdfRequestComplete(request, STATUS_BUFFER_TOO_SMALL);
+        return;
+    }
+    NTSTATUS st = WdfRequestRetrieveInputBuffer(request, sizeof(*input), (PVOID*)&input, NULL);
+    if (NT_SUCCESS(st)) {
+        /* METHOD_BUFFERED shares input/output storage. Copy before replying. */
+        AsbPrivateDisplayRequest command = *input;
+        st = WdfRequestRetrieveOutputBuffer(request, sizeof(*output), (PVOID*)&output, NULL);
+        if (NT_SUCCESS(st)) st = VddPrivateCommand(ctx, &command, output);
+    }
+    if (!NT_SUCCESS(st)) VddLog("Private: control request failed 0x%08X", st);
+    WdfRequestCompleteWithInformation(request, st, NT_SUCCESS(st) ? sizeof(*output) : 0);
+}
+
+static EVT_WDF_WORKITEM VddPrivateWork;
+static VOID VddPrivateWork(WDFWORKITEM work)
+{
+    VDD_DEVICE_CONTEXT* ctx = WdfObjectGet_IndirectDeviceContextWrapper(
+        (WDFDEVICE)WdfWorkItemGetParentObject(work))->pContext;
+    AcquireSRWLockExclusive(&ctx->privateControlLock);
+    WDFREQUEST request;
+    while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ctx->hPrivateQueue, &request)))
+        VddPrivateRequest(ctx, request);
+    ReleaseSRWLockExclusive(&ctx->privateControlLock);
+}
+
+/* IddCx owns the device's I/O dispatch and hands user-mode IOCTLs to this callback
+   (without it IddCx fails them with STATUS_NOT_SUPPORTED). Monitor arrival/departure
+   must not run on this dispatch thread: queue the request and return. */
+static EVT_IDD_CX_DEVICE_IO_CONTROL VddDeviceIoControl;
+static VOID VddDeviceIoControl(WDFDEVICE device, WDFREQUEST request,
+    size_t outputLength, size_t inputLength, ULONG code)
+{
+    UNREFERENCED_PARAMETER(outputLength);
+    UNREFERENCED_PARAMETER(inputLength);
+    if (code != ASB_PRIVATE_IOCTL) {
+        WdfRequestComplete(request, STATUS_NOT_SUPPORTED);
+        return;
+    }
+    VDD_DEVICE_CONTEXT* ctx = WdfObjectGet_IndirectDeviceContextWrapper(device)->pContext;
+    if (!ctx || !ctx->hPrivateQueue || !ctx->hPrivateWork ||
+        InterlockedCompareExchange(&ctx->stopping, 0, 0)) {
+        WdfRequestComplete(request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+    NTSTATUS st = WdfRequestForwardToIoQueue(request, ctx->hPrivateQueue);
+    if (!NT_SUCCESS(st)) {
+        VddLog("Private: forwarding control request failed 0x%08X", st);
+        WdfRequestComplete(request, st);
+        return;
+    }
+    WdfWorkItemEnqueue(ctx->hPrivateWork);
+}
+
+/* ========================================================================= */
 /*  IddCx: Assign / Unassign Swap Chain                                     */
 /* ========================================================================= */
 
@@ -2034,6 +2410,8 @@ static NTSTATUS VddAssignSwapChain(
     proc->hPendingConn   = NULL;
     proc->bStopNetwork   = FALSE;
     proc->frameSeq       = 0;
+    proc->hMonitor = MonitorObject;
+    VddAdoptKeptClient(ctx, proc, MonitorObject);
     asb_vdd_screenshot_init(&proc->screenshot, proc->pDevice,
         proc->pDeviceContext, proc->hTerminateEvent, VddLog);
 
@@ -2119,6 +2497,10 @@ _Use_decl_annotations_
 NTSTATUS VddMonitorAssignSwapChain(IDDCX_MONITOR MonitorObject, const IDARG_IN_SETSWAPCHAIN* pInArgs)
 {
     VDD_DEVICE_CONTEXT* ctx = WdfObjectGet_MonitorContextWrapper(MonitorObject)->pContext;
+    if (WdfObjectGet_MonitorContextWrapper(MonitorObject)->isPrivate) {
+        if (InterlockedCompareExchange(&ctx->stopping, 0, 0)) return (NTSTATUS)0xC01E0012L;
+        return VddAssignPrivateSwapChain(ctx, pInArgs);
+    }
     AcquireSRWLockExclusive(&ctx->swapLock);
     if (ctx->hMonitor != MonitorObject || ctx->swapChanging ||
         InterlockedCompareExchange(&ctx->stopping, 0, 0)) {
@@ -2129,9 +2511,15 @@ NTSTATUS VddMonitorAssignSwapChain(IDDCX_MONITOR MonitorObject, const IDARG_IN_S
     VDD_SWAP_PROC* previous = ctx->pSwapProc;
     ctx->pSwapProc = NULL;
     ReleaseSRWLockExclusive(&ctx->swapLock);
-    VddDestroySwapProc(previous);
+    VDD_KEPT_CLIENT keep = {};
+    VddDestroySwapProc(previous, &keep);
     AcquireSRWLockExclusive(&ctx->swapLock);
+    if (keep.conn) {
+        VddDropKeptClient(ctx, "superseded");
+        ctx->keptClient = keep;
+    }
     NTSTATUS status = VddAssignSwapChain(MonitorObject, pInArgs);
+    VddDropKeptClient(ctx, "not adopted");
     ctx->swapChanging = FALSE;
     ReleaseSRWLockExclusive(&ctx->swapLock);
     if (ctx->hRecoveryTimer) WdfTimerStart(ctx->hRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(5));
@@ -2145,6 +2533,16 @@ NTSTATUS VddMonitorUnassignSwapChain(
     MonitorContextWrapper* pMonCtx = WdfObjectGet_MonitorContextWrapper(MonitorObject);
     VDD_DEVICE_CONTEXT* ctx = pMonCtx->pContext;
 
+    if (pMonCtx->isPrivate) {
+        AcquireSRWLockExclusive(&ctx->privateLock);
+        VDD_PRIVATE_SWAP* swap = ctx->pPrivateSwap;
+        ctx->pPrivateSwap = NULL;
+        ReleaseSRWLockExclusive(&ctx->privateLock);
+        VddDestroyPrivateSwap(swap);
+        VddLog("Private: swap chain unassigned");
+        return STATUS_SUCCESS;
+    }
+
     AcquireSRWLockExclusive(&ctx->swapLock);
     VDD_SWAP_PROC* proc = ctx->pSwapProc;
     if (!proc || proc->hMonitor != MonitorObject) {
@@ -2154,8 +2552,13 @@ NTSTATUS VddMonitorUnassignSwapChain(
     ctx->pSwapProc = NULL;
     ctx->swapChanging = TRUE;
     ReleaseSRWLockExclusive(&ctx->swapLock);
-    VddDestroySwapProc(proc);
+    VDD_KEPT_CLIENT keep = {};
+    VddDestroySwapProc(proc, &keep);
     AcquireSRWLockExclusive(&ctx->swapLock);
+    if (keep.conn) {
+        VddDropKeptClient(ctx, "superseded");
+        ctx->keptClient = keep;
+    }
     ctx->swapChanging = FALSE;
     ReleaseSRWLockExclusive(&ctx->swapLock);
 
@@ -2270,6 +2673,8 @@ NTSTATUS VddAdapterCommitModes(
 {
     VDD_DEVICE_CONTEXT* ctx = WdfObjectGet_IndirectDeviceContextWrapper(AdapterObject)->pContext;
     for (UINT i = 0; i < pInArgs->PathCount; ++i) {
+        if (pInArgs->pPaths[i].MonitorObject &&
+            WdfObjectGet_MonitorContextWrapper(pInArgs->pPaths[i].MonitorObject)->isPrivate) continue;
         if (ctx->gpuModes && (pInArgs->pPaths[i].Flags & IDDCX_PATH_FLAGS_CHANGED)) {
             InterlockedExchange(&ctx->reconfiguring, 1);
             if (ctx->hRecoveryTimer) WdfTimerStart(ctx->hRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(5));
@@ -2295,7 +2700,9 @@ NTSTATUS VddAdapterCommitModes2(
         UINT flags = (UINT)pInArgs->pPaths[i].Flags;
         BOOL active = (flags & IDDCX_PATH_FLAGS_ACTIVE) != 0;
         BOOL changed = (flags & IDDCX_PATH_FLAGS_CHANGED) != 0;
-        if (ctx->gpuModes && changed) {
+        BOOL privatePath = pInArgs->pPaths[i].MonitorObject &&
+            WdfObjectGet_MonitorContextWrapper(pInArgs->pPaths[i].MonitorObject)->isPrivate;
+        if (ctx->gpuModes && changed && !privatePath) {
             InterlockedExchange(&ctx->reconfiguring, 1);
             if (ctx->hRecoveryTimer) WdfTimerStart(ctx->hRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(5));
         }
@@ -2551,6 +2958,7 @@ NTSTATUS VddDeviceAdd(
     iddConfig.EvtIddCxMonitorGetDefaultDescriptionModes  = VddMonitorGetDefaultModes;
     iddConfig.EvtIddCxMonitorAssignSwapChain             = VddMonitorAssignSwapChain;
     iddConfig.EvtIddCxMonitorUnassignSwapChain           = VddMonitorUnassignSwapChain;
+    iddConfig.EvtIddCxDeviceIoControl                    = VddDeviceIoControl;
 
     /* Use v2 callbacks when compiled with IddCx 1.10+ */
     if (IDD_IS_FIELD_AVAILABLE(IDD_CX_CLIENT_CONFIG, EvtIddCxAdapterQueryTargetInfo)) {
@@ -2639,6 +3047,31 @@ NTSTATUS VddDeviceAdd(
             VddLog("DeviceAdd: recovery timer created");
         } else {
             VddLog("DeviceAdd: WdfTimerCreate FAILED st=0x%08X (recovery disabled)", st);
+        }
+    }
+
+    /* Remote Windows private display control: acknowledged arrival/departure on a WDF
+       work item. No polling, registry preferences, or removal on client handle close.
+       Failure here only disables private sharing; the desktop monitor is unaffected. */
+    {
+        WDF_IO_QUEUE_CONFIG controlConfig;
+        WDF_IO_QUEUE_CONFIG_INIT(&controlConfig, WdfIoQueueDispatchManual);
+        NTSTATUS controlStatus = WdfIoQueueCreate(hDevice, &controlConfig, WDF_NO_OBJECT_ATTRIBUTES,
+                                                  &ctx->hPrivateQueue);
+        if (NT_SUCCESS(controlStatus)) {
+            WDF_WORKITEM_CONFIG privateWorkConfig;
+            WDF_WORKITEM_CONFIG_INIT(&privateWorkConfig, VddPrivateWork);
+            privateWorkConfig.AutomaticSerialization = FALSE;
+            WDF_OBJECT_ATTRIBUTES privateWorkAttrs;
+            WDF_OBJECT_ATTRIBUTES_INIT(&privateWorkAttrs);
+            privateWorkAttrs.ParentObject = hDevice;
+            controlStatus = WdfWorkItemCreate(&privateWorkConfig, &privateWorkAttrs, &ctx->hPrivateWork);
+        }
+        if (NT_SUCCESS(controlStatus))
+            controlStatus = WdfDeviceCreateDeviceInterface(hDevice, &ASB_PRIVATE_DISPLAY_INTERFACE, NULL);
+        if (!NT_SUCCESS(controlStatus)) {
+            VddLog("Private: control interface unavailable 0x%08X", controlStatus);
+            ctx->hPrivateWork = NULL;
         }
     }
 

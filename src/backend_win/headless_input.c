@@ -18,7 +18,29 @@ struct AsbInputSession {
     InputPacket replies[64];
     unsigned head,tail;
     unsigned viewers,claiming,retired;
+    AsbInputWatch watch;            /* eh6.7: user source / epoch / hold / owner changes */
+    void *watch_ctx;
 };
+
+/* Snapshot of what watchers care about; compared before and after each operation. */
+typedef struct { UINT32 epoch,hold,owner,transition,source; SOCKET connection; } WatchState;
+
+static WatchState watch_state(const AsbInputSession *s)
+{
+    WatchState w={s->router.user_epoch,s->router.hold,s->router.owner,s->router.transition,s->router.user_source,s->connection};
+    return w;
+}
+
+/* Called with the session lock NOT held. The callback runs under the shared lock, so removing the
+   watcher (exclusive) waits for a running callback; it must only post a message and never call
+   back into the session. */
+static void notify(AsbInputSession *s,const WatchState *before)
+{
+    AcquireSRWLockShared(&s->lock);
+    WatchState now=watch_state(s);
+    if (s->watch && memcmp(&now,before,sizeof(now))) s->watch(s->watch_ctx);
+    ReleaseSRWLockShared(&s->lock);
+}
 
 static SRWLOCK registry_lock=SRWLOCK_INIT;
 static AsbInputSession *sessions[ASB_MAX_VMS];
@@ -60,7 +82,7 @@ static BOOL negotiate(AsbInputSession *session,SOCKET fd,UINT32 *keyboard,UINT32
     if (ioctlsocket(fd,FIONBIO,&nonblock)) return FALSE;
     UINT32 request=(UINT32)InterlockedIncrement(&request_id);
     InputPacket queries[]={{INPUT_MAGIC,INPUT_KEYBOARD_QUERY,INPUT_KEYBOARD_VERSION,request,0},
-        {INPUT_MAGIC,INPUT_MOUSE_QUERY,INPUT_MOUSE_NORMALIZED_VERSION,request,0}};
+        {INPUT_MAGIC,INPUT_MOUSE_QUERY,INPUT_MOUSE_VIRTUAL_VERSION,request,0}};
     if (send(fd,(const char *)queries,sizeof(queries),0)!=sizeof(queries)) return FALSE;
     BOOL keyboard_reply=FALSE,mouse_reply=FALSE;
     ULONGLONG deadline=GetTickCount64()+500;
@@ -83,7 +105,7 @@ static BOOL negotiate(AsbInputSession *session,SOCKET fd,UINT32 *keyboard,UINT32
                 if (reply->param1==INPUT_KEYBOARD_VERSION) *keyboard=INPUT_KEYBOARD_VERSION;
             } else if (reply->type==INPUT_MOUSE_REPLY) {
                 mouse_reply=TRUE;
-                if (reply->param1>=INPUT_MOUSE_VERSION && reply->param1<=INPUT_MOUSE_NORMALIZED_VERSION) *mouse=reply->param1;
+                if (reply->param1>=INPUT_MOUSE_VERSION && reply->param1<=INPUT_MOUSE_VIRTUAL_VERSION) *mouse=reply->param1;
             }
         }
         *got=0;
@@ -110,22 +132,33 @@ static DWORD WINAPI worker(void *context)
         AcquireSRWLockExclusive(&s->lock);s->negotiating=INVALID_SOCKET;ReleaseSRWLockExclusive(&s->lock);
         if (!connected) goto close;
         AcquireSRWLockExclusive(&s->lock);
+        WatchState connected_before=watch_state(s);
         s->connection=fd;s->keyboard=keyboard;s->mouse=mouse;
         WakeAllConditionVariable(&s->changed);
         ReleaseSRWLockExclusive(&s->lock);
+        notify(s,&connected_before);
         while (WaitForSingleObject(s->stop,0)!=WAIT_OBJECT_0) {
             AcquireSRWLockShared(&s->lock);
             needed=s->viewers || s->claiming || s->router.working || s->router.transition;
             ReleaseSRWLockShared(&s->lock);
             if (!needed) break;
             int n=recv(fd,(char *)&packet+count,sizeof(packet)-count,0);
-            if (n==SOCKET_ERROR && WSAGetLastError()==WSAEWOULDBLOCK) { WaitForSingleObject(s->stop,5);continue; }
+            if (n==SOCKET_ERROR && WSAGetLastError()==WSAEWOULDBLOCK) {
+                AcquireSRWLockExclusive(&s->lock);
+                WatchState idle_before=watch_state(s);
+                int expired=asb_input_router_expire(&s->router,GetTickCount64());
+                ReleaseSRWLockExclusive(&s->lock);
+                if (expired) notify(s,&idle_before);
+                WaitForSingleObject(s->stop,5);
+                continue;
+            }
             if (n<=0) break;
             count+=n;
             if (count!=sizeof(packet)) continue;
             count=0;
             if (packet.magic!=INPUT_MAGIC) break;
             AcquireSRWLockExclusive(&s->lock);
+            WatchState reply_before=watch_state(s);
             asb_input_router_reply(&s->router,&packet);
             if (packet.type==INPUT_MOUSE_REPLY && (packet.param2&0x80000000u)) {
                 s->barrier_done=packet.param2;
@@ -134,12 +167,15 @@ static DWORD WINAPI worker(void *context)
             }
             WakeAllConditionVariable(&s->changed);
             ReleaseSRWLockExclusive(&s->lock);
+            notify(s,&reply_before);
         }
         AcquireSRWLockExclusive(&s->lock);
+        WatchState lost_before=watch_state(s);
         s->connection=INVALID_SOCKET;s->keyboard=1;s->mouse=0;
         asb_input_router_disconnect(&s->router);
         WakeAllConditionVariable(&s->changed);
         ReleaseSRWLockExclusive(&s->lock);
+        notify(s,&lost_before);
 close:
         closesocket(fd);
 retry:
@@ -222,6 +258,7 @@ ASB_API DWORD asb_input_claim(AsbInputSession *s,const AsbInputStatus *labels)
     AcquireSRWLockExclusive(&s->lock);
     if (s->retired) { ReleaseSRWLockExclusive(&s->lock);return ERROR_NOT_READY; }
     if (s->router.cancelled) { ReleaseSRWLockExclusive(&s->lock);return ERROR_CANCELLED; }
+    WatchState before=watch_state(s);
     ULONGLONG deadline=GetTickCount64()+10000;
     ++s->claiming;
     BOOL new_work=!s->router.working;
@@ -250,6 +287,7 @@ ASB_API DWORD asb_input_claim(AsbInputSession *s,const AsbInputStatus *labels)
     }
     --s->claiming;
     ReleaseSRWLockExclusive(&s->lock);
+    notify(s,&before);
     return error;
 }
 
@@ -257,20 +295,104 @@ ASB_API DWORD asb_input_control(AsbInputSession *s,UINT32 command,UINT32 work)
 {
     if (!s) return ERROR_INVALID_HANDLE;
     AcquireSRWLockExclusive(&s->lock);
+    WatchState before=watch_state(s);
     DWORD error=s->retired?ERROR_NOT_READY:asb_input_router_control(&s->router,command,work);
     if (error==ERROR_WRITE_FAULT && s->connection==INVALID_SOCKET && command!=ASB_INPUT_USER_GRANT) error=0;
     WakeAllConditionVariable(&s->changed);
     ReleaseSRWLockExclusive(&s->lock);
+    notify(s,&before);
     return error;
 }
 
 ASB_API DWORD asb_input_send(AsbInputSession *s,BOOL agent,UINT32 lease,const InputPacket *p)
 {
     if (!s) return ERROR_INVALID_HANDLE;
+    /* User input without a source is the desktop viewer's (eh6.7). */
+    if (!agent) return asb_input_send_user(s,ASB_INPUT_SOURCE_VIEWER,0,p);
     AcquireSRWLockExclusive(&s->lock);
     DWORD error=s->retired?ERROR_NOT_READY:asb_input_router_send(&s->router,agent,lease,p);
     ReleaseSRWLockExclusive(&s->lock);
     return error;
+}
+
+/* ---- user sources (AppSandbox-eh6.7) ---- */
+
+ASB_API UINT32 asb_input_focus(AsbInputSession *s,UINT32 source,BOOL renew)
+{
+    if (!s || !source) return 0;
+    AcquireSRWLockExclusive(&s->lock);
+    WatchState before=watch_state(s);
+    UINT32 epoch=s->retired?0:asb_input_router_focus(&s->router,source,renew,GetTickCount64());
+    ReleaseSRWLockExclusive(&s->lock);
+    notify(s,&before);
+    return epoch;
+}
+
+ASB_API DWORD asb_input_send_user(AsbInputSession *s,UINT32 source,UINT32 epoch,const InputPacket *p)
+{
+    if (!s) return ERROR_INVALID_HANDLE;
+    AcquireSRWLockExclusive(&s->lock);
+    WatchState before=watch_state(s);
+    DWORD error=s->retired?ERROR_NOT_READY:0;
+    if (!error && p && p->type==INPUT_MOUSE_MOVE && p->param3==INPUT_MOUSE_VIRTUAL &&
+        s->mouse<INPUT_MOUSE_VIRTUAL_VERSION)
+        error=ERROR_NOT_SUPPORTED;   /* guest input component predates virtual-desktop moves */
+    if (!error) error=asb_input_router_send_user(&s->router,source,epoch,p,GetTickCount64());
+    ReleaseSRWLockExclusive(&s->lock);
+    notify(s,&before);
+    return error;
+}
+
+ASB_API void asb_input_guard(AsbInputSession *s,UINT32 source,BOOL on)
+{
+    if (!s) return;
+    AcquireSRWLockExclusive(&s->lock);
+    asb_input_router_guard(&s->router,source,on);
+    ReleaseSRWLockExclusive(&s->lock);
+}
+
+ASB_API UINT32 asb_input_hold(AsbInputSession *s)
+{
+    if (!s) return 0;
+    AcquireSRWLockExclusive(&s->lock);
+    WatchState before=watch_state(s);
+    UINT32 hold=s->retired?0:asb_input_router_hold(&s->router,GetTickCount64());
+    ReleaseSRWLockExclusive(&s->lock);
+    notify(s,&before);
+    return hold;
+}
+
+ASB_API void asb_input_unhold(AsbInputSession *s,UINT32 hold,BOOL ok)
+{
+    if (!s) return;
+    AcquireSRWLockExclusive(&s->lock);
+    WatchState before=watch_state(s);
+    asb_input_router_unhold(&s->router,hold,ok);
+    ReleaseSRWLockExclusive(&s->lock);
+    notify(s,&before);
+}
+
+ASB_API void asb_input_watch(AsbInputSession *s,AsbInputWatch fn,void *ctx)
+{
+    if (!s) return;
+    AcquireSRWLockExclusive(&s->lock);
+    s->watch=fn;s->watch_ctx=ctx;
+    ReleaseSRWLockExclusive(&s->lock);
+}
+
+ASB_API void asb_input_user_state(AsbInputSession *s,AsbInputUserState *out)
+{
+    memset(out,0,sizeof(*out));
+    if (!s) return;
+    AcquireSRWLockShared(&s->lock);
+    out->source=s->router.user_source;
+    out->epoch=s->router.user_epoch;
+    out->hold=s->router.hold;
+    out->user_owns=s->router.owner!=ASB_CONTROL_AGENT && !s->router.transition && !s->retired;
+    out->connected=s->connection!=INVALID_SOCKET;
+    out->mouse_version=s->mouse;
+    out->keyboard_version=s->keyboard;
+    ReleaseSRWLockShared(&s->lock);
 }
 
 ASB_API BOOL asb_input_poll(AsbInputSession *s,InputPacket *p)
@@ -292,7 +414,7 @@ ASB_API DWORD asb_input_barrier(AsbInputSession *s,UINT32 lease,DWORD timeout)
     UINT32 id=0;
     if (!error) {
         id=(++s->router.sequence)|0x80000000u;
-        InputPacket packet={INPUT_MAGIC,INPUT_MOUSE_QUERY,INPUT_MOUSE_NORMALIZED_VERSION,id,0};
+        InputPacket packet={INPUT_MAGIC,INPUT_MOUSE_QUERY,INPUT_MOUSE_VIRTUAL_VERSION,id,0};
         if (!emit(s,&packet)) error=ERROR_WRITE_FAULT;
     }
     ULONGLONG deadline=GetTickCount64()+timeout;

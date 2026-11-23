@@ -476,3 +476,190 @@ Native API references:
 [TASKDIALOGCONFIG](https://learn.microsoft.com/en-us/windows/win32/api/commctrl/ns-commctrl-taskdialogconfig),
 [HttpWaitForDisconnect](https://learn.microsoft.com/en-us/windows/win32/api/http/nf-http-httpwaitfordisconnect),
 [CancelIoEx](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelioex).
+
+# Remote Windows protocol and session contracts (eh6.2)
+
+```powershell
+.\tools\tests\test-remote-windows-protocol.ps1
+node .\tools\tests\remote_windows_registration_test.cjs
+```
+
+The native suite builds `tools/tests/remote_windows_protocol_test.c` with
+`/W4 /WX` against the shared codec (`tools/transport/asb_remote_windows.c`), the
+guest window collector (`tools/agent/remote_windows_inventory.c`) and the HvSocket
+service table (`src/backend_win/hcs_services.c`). It covers:
+
+| Area | Evidence |
+| --- | --- |
+| Channels | Channels 1-8 and the input/display/screenshot packet contracts are unchanged. Windows guests get services 1-11; Linux and legacy empty `os_type` keep exactly 1-6 and 8. |
+| Codec | Round trips for every message type at their size limits, including CPU/GPU frames and file chunks. Every strict prefix is "need more". Bad magic, wire version, type, channel, oversize lengths (rejected from the header), trailing bytes, inverted rectangles, invalid enums, frame shapes and unsafe file paths are rejected. A 200,000-iteration mutation fuzz checks that every accepted message re-encodes byte-for-byte. |
+| Negotiation | Both endpoints compute identical results. Old (v0), newer-only and invalid version ranges are refused. An older guest without the required capabilities gets `upgrade_required` rather than reduced sharing. Unknown capability bits are ignored and limits take the minimum of both sides. |
+| Identity | IDs are stable per window. HWND reuse by another process, PID reuse, destroyed windows, forged IDs and IDs from a previous connection (including a repeated session tag) are `stale_id`. The table is bounded. |
+| Inventory | Visible or minimized standard-user roots in the active session are included. Hidden, cloaked, owned, tool, no-caption, untitled, shell, helper, elevated and unknown-elevation windows are excluded. Selected roots stay listed. Association is by ownership only; same-process windows and shadows are never associated. Add/change/remove events and generations are tested, event overflow is bounded, and duplicate titles are labelled with the application name and an ordinal. |
+| Native windows | Real off-screen windows in the test process are enumerated (normal, duplicate, tool, owned, hidden, minimized, DWM-cloaked, popup, custom chrome, untitled), along with the real taskbar. A destroyed window's ID becomes stale immediately. |
+
+The registration test checks core project registration, the tested ServiceTable wiring in
+`hcs_vm.c`, the unchanged channel numbers, and that no HTTP/MCP/Python surface mentions the feature.
+
+# Remote Windows private display (eh6.3)
+
+```powershell
+.\tools\tests\test-remote-windows-display.ps1
+```
+
+The script builds and runs two focused suites with `/W4 /WX` and builds a guest-only
+native check:
+
+| Suite | Evidence |
+| --- | --- |
+| Driver (`remote_windows_display_driver_test.cpp`) | Extracts the real `VddCreatePrivateMonitor`/`VddRemovePrivateMonitor`, `VddTargetResolutions`, the EDID builder/parser and the `VDD_EDID` template from `tools/vdd`, and compiles `private_control.inl` against a mocked IddCx boundary. Covers the private identity (EDID `ASB0002`, serial 2, connector 1, own container ID, same `AppSandboxVDD` name), modes independent of desktop GPU/CPU mode negotiation, 20 arrival/departure cycles with alternating modes, failed create/arrival with no leaked monitor or lease, failed departure retry, lease token enforcement, REMOVE refused until RESTORE, guest mode limits (640x480 to 7680x4320) and IVSHMEM refusal. |
+| Guest (`remote_windows_display_guest_test.c`) | Runs the real `tools/agent/remote_windows_display.c` and `appsandbox-displays.c` against a stateful CCD model. Covers identity by PnP device path (never friendly name or enumeration order), the compact two-path topology that leaves the desktop's own modes untouched, verifying before applying, desktop resize while sharing, re-placing a misplaced private output, refusing foreign/cloned outputs and topologies Windows rejects, bounded retries, removal only after a successful source restoration, and no `SDC_SAVE_TO_DATABASE` while the private output exists. The watcher keeps the desktop primary at (0,0), puts the private output beyond its right edge, recovers in two passes after desktop re-arrival, never re-enables a removed private output and keeps its existing single-desktop behaviour. |
+| Manual helper (`remote_windows_display_toggle.c`) | Built only, not part of the product. `asb-private-display.exe start [width height]`, `stop` and `status` turn the private output on and off by hand in a guest, run as a standard user. `start` saves its lease token to `%LOCALAPPDATA%\AppSandbox\private-display.lease` before activating and leaves the output in place when it exits. `stop` restores and removes the output using that token. It parks nothing. |
+| Native check (`remote_windows_display_native_check.c`) | Built only. Copy `bin\tests\remote-windows-display\remote-windows-display-native-check.exe` into a Windows 11 guest running this branch's VDD and run it unelevated, optionally with a watch period in seconds (`... 90`) for resizing the viewer and taking API screenshots. It checks the standard-user control path, that the desktop stays primary and remains the `SM_CXSCREEN` input target, private placement, refusals, parking a real window, and that the window is restored before removal. Results go to `%LOCALAPPDATA%\AppSandbox\eh6.3-native-check.log`. |
+
+Later additions:
+
+- `remote_windows_display_keep_test.cpp` covers the VDD keeping the host frame connection across a desktop swap-chain reassignment. Private-output arrival and departure re-commit modes, and IddCx reassigns the desktop swap chain. Only CPU-path connections are kept; connections with GPU texture state reconnect as before.
+- The guest suite also covers the display watcher. It retries refused topologies for about 5 s instead of exiting. It also returns unmarked windows from the private output to the desktop, after every display pass and once a second while a private output exists. Windows land there when Windows migrates them while the desktop output is re-created during a viewer resize. A window stays on the private output only if it, or a window that owns it, carries the `AppSandbox.PrivateDisplay.Parked` property (`ASB_PRIVATE_PARKED_PROPERTY`), or if it is a caption-less popup from a process that has a marked root.
+
+The private output is controlled through the VDD's device interface
+`{66d5c6a1-78f7-44af-91b3-3304f165c528}`. Its INF security descriptor grants
+read/write to interactive users, and every operation except QUERY requires a lease
+token. Nothing writes registry preferences, and closing the handle never removes the
+output.
+
+# Remote Windows guest helper, window parking and restoration journal (eh6.4)
+
+```powershell
+.\tools\tests\test-remote-windows-share.ps1            # add -SkipNative to skip the real-window suite
+```
+
+The script builds everything with `/W4 /WX`, runs two suites and the registration test, and
+builds the helper (`appsandbox-remote-windows.exe`):
+
+| Suite | Evidence |
+| --- | --- |
+| Model (`remote_windows_share_test.c`) | Runs the real parking/journal core (`tools/agent/remote_windows_share.c`) and helper control session (`remote_windows_helper.c`) against a stateful window model. The model covers placement and show state (with the mixed-DPI drift of a single placement), styles, owners, the parked property, taskbar tabs, responsiveness, handle reuse, the private-display lease and the journal file. Every modifying call asserts that the journal already holds the window's record. Covered: select/unselect of normal, minimized, maximized and minimized-from-maximized originals (renderable, never activated, exact restore); rollback after a failure at each step (mark, show, move, verify, style, owner), a journal write failure and a display failure; owned dialogs (direct and chained) travelling with the root while popups and independent same-process roots stay untouched; concurrent application style and owner changes surviving restoration; destroyed and reused handles dropped untouched; hung windows (select refused, restoration pending and retried, display kept); recovery after helper death (identities validated, never re-parked, PARKING records, journaled lease, hung survivors, corrupt journal); display drift; the table limit; and the protocol (HELLO/version gate, snapshot and events, PENDING/SHARED and RESTORING/NONE acknowledgements, stale and elevated, RESTORE_ALL, UPGRADE_REQUIRED, malformed input, restoring on close). Three mutations of the core (one placement on restore, an unconditional owner reset, no journal write before parking) each fail it. |
+| Native (`remote_windows_share_native_test.c`) | Uses real windows owned by a separate application process and the real Win32 ops (`remote_windows_share_win32.c`). In host mode the "private display" is a region far to the right of every monitor. The original windows hang 8 px below the lowest monitor's bottom edge, because `SetWindowPlacement` moves windows that are completely off-screen. Expect off-screen taskbar buttons for a few seconds. The suite parks normal and minimized roots, checks the owned dialog follows and the independent root is untouched, survives application style changes and migration, and restores exactly. A second helper process then parks a window and is killed: Windows unlinks the window (it is not destroyed) and recovery restores it from the journal. A shared window the application closes is dropped. The application process survives every step. |
+
+Guest check: copy `bin\tests\remote-windows-share\remote-windows-share-native-test.exe` into a
+Windows 11 guest running this branch's VDD and display watcher, and run it unelevated with
+`--guest`. It uses the real private display and adds a maximized original. It logs to
+`%LOCALAPPDATA%\AppSandbox\eh6.4-native-check.log`.
+
+The helper runs in the active console session as the signed-in user. The guest service
+(`agent.c`) starts it with the private-display lease on stdin and an inherited stop event (no
+other handles are inherited). The service keeps the lease across helper restarts and stops the
+helper gracefully (it restores every window first). If the helper dies or has to be killed, the
+service runs `appsandbox-remote-windows.exe --recover` in that session. After a logoff, when no
+window survives, the service removes the private display itself. The journal is
+`%LOCALAPPDATA%\AppSandbox\RemoteWindows\journal.bin`. It records the originals and the lease,
+never a selection to re-establish. The log is `helper.log` in the same folder.
+# Remote Windows per-window capture and frame delivery (eh6.5)
+
+```powershell
+.\tools\tests\test-remote-windows-frames.ps1           # -SkipNative skips the real-capture suite
+.\tools\tests\test-remote-windows-frames.ps1 -Evidence C:\path\to\evidence   # BMPs + log
+```
+
+The script builds everything with `/W4 /WX` (the capture engine is C++/WinRT, C++20), runs two
+suites and builds the helper with its capture engine. The eh6.4 share script also exercises the
+helper's surface tracking.
+
+| Suite | Evidence |
+| --- | --- |
+| Model (`remote_windows_frames_test.c`) | The real frame-channel codec and the guest (`AsbRwTx`) and host (`AsbRwRx`) flow state machines (`tools/transport/asb_rw_frames.c`), connected through the codec. Covered: size/length validation of every channel-10 message (stride/data length, generation 0, slots, pool sizes, handle/status pairing, root/kind consistency, z, flags, rectangles, truncation, trailing bytes, oversize headers rejected before allocation, wrong channel, ERROR on any channel); FRAMES_HELLO negotiation (stale session tag refused, GPU only for matching non-Basic-Render adapters, forced CPU); queue and memory bounds with a consumer that never reads (slots in flight, one pending frame, superseded frames released, CPU byte budget across surfaces); stale generations (resize, held frame retired, old frames released never shown, unannounced generation refused, generations only grow); GPU pool lifetimes (no slot before POOL_STATUS, slot reuse before release, content larger than the pool, shrink/grow, stale pool results, host- and guest-side pool failure falling back to CPU, recovery re-enabling GPU, releases for an invalidated generation are stale); teardown (SURFACE_END frees host state, late releases ignored, frames after the end refused, disconnect) and table limits; popup association. |
+| Helper surfaces (`remote_windows_share_test.c`, `test_helper_surfaces`) | The helper sends SURFACES for a parked root with owned tooltip/menu and unowned same-process popup bridge, bottom-to-top, with rects outside the root, but not an independent same-process root, another process's popup or a shadow; IDs are stable session IDs; unchanged sets are not resent; a closed popup's ID is released; unselect and session close send count 0 / empty capture sets. |
+| Native (`remote_windows_frames_native_test.c`) | Real Windows Graphics Capture through the real capture engine (`tools/agent/remote_windows_capture.cpp`) and the real host receiver (`src/backend_win/remote_windows_frames_host.c`) over loopback TCP (GPU pools shared with `DuplicateHandle` instead of `D3DKMTDuplicateHandle`). Surfaces come from the real scan and `asb_rw_collect_surfaces`. For shared GPU pools and then forced CPU frames: live root content (changing frames, magenta marker), an owned per-pixel-alpha popup past the root's right edge (premultiplied alpha preserved, z above the root), an overflowing popup menu as its own surface and its SURFACE_END on close, resize generations, guest device loss and recovery (new generation, frames continue), host device loss (everything freed) and reconnect, a frame channel for another control session refused, bounds with a slow consumer, teardown with no texture or CPU buffer left. |
+
+Guest check (Windows 11 guest, branch host so the VM has services 9-11): copy
+`build\eh6.5\deploy\eh65` into the guest, run `install.cmd` elevated, then
+`remote-windows-capture-test-app.exe` unelevated (animated root, alpha popup, an overflowing
+menu at 8-14 s of every 30 s cycle, a capture-engine device loss at 20 s of every cycle; its log
+is `%TEMP%\eh6.5-capture-test-app.log`). On the host, unelevated:
+`bin\tests\remote-windows-frames\remote-windows-frames-vm-check.exe --evidence <dir>` (built by the
+script). It selects the window over channel 9, receives
+channel 10 frames with shared GPU pools (including a host device loss and reconnect) and then
+forced CPU frames, and finally unselects and checks that every surface ended.
+
+Frame channel rules (see `asb_remote_windows.h`, "Frame channel"): every root and associated
+popup is a separate capture with its own generation; the guest keeps at most the agreed slots in
+flight per surface and only the newest capture while they are busy; the host keeps one pending
+and one displayed frame per surface and releases every frame exactly once. GPU pools are BGRA
+keyed-mutex textures created by the host per surface generation and duplicated into the helper.
+
+# Remote Windows native host proxies (eh6.6)
+
+```powershell
+.\tools\tests\test-remote-windows-proxy.ps1            # model suite, builds, native suite (GPU, then forced CPU)
+.\tools\tests\test-remote-windows-proxy.ps1 -SkipNative
+.\tools\tests\test-remote-windows-proxy.ps1 -Evidence C:\path\to\evidence   # screenshots (BMP) + logs
+.\tools\tests\test-remote-windows-proxy.ps1 -Snap      # also Win+Left on a proxy (takes the foreground briefly)
+```
+
+Everything builds with `/W4 /WX` (the manager is C++20; everything else C). The native suite puts
+real windows on the primary monitor for about a minute (shown without activation; no input is
+injected unless `-Snap`).
+
+| Suite | Evidence |
+| --- | --- |
+| Model (`remote_windows_proxy_test.c`) | Codecs of HIT_TEST / WINDOW_STATE / WINDOW_ICON (round trips, request without code, flag/request/limit/icon-size validation, payload length, control channel only). Host session (`src/backend_win/remote_windows_session.c`) against recorded proxy operations: negotiation (an eh6.5 guest keeps the inventory but selection answers `upgrade_required` without asking the guest); proxy identities and lifetimes (one proxy per SHARED root, duplicates/foreign-session IDs ignored, FAILED keeps the error without a proxy, host unselect destroys at once and never sends a close, NONE+STALE_ID, RESTORE_ALL and session end destroy everything, a proxy that cannot be created undoes the selection); acknowledged geometry (one command in flight, newest request coalesced, stale/unknown serials ignored, application minimum adopted, not during a host size loop but when it ends, BUSY retried by the timer, unanswered commands resent, host minimize reported without resizing, maximize never adopted back, application-initiated sizes followed only when nothing is pending); state feedback (styles/limits/modal-disabled forwarded, first state is a baseline, application maximize/minimize replayed, maximize toggles when the proxy is maximized, icons, titles); modal ownership and Close (disabled root: Close not forwarded, the owned window is brought forward; owned windows closed with their own ID; BUSY brings the dialog forward; one Close in flight; prompt + cancellation keeps the proxy; a later Close is forwarded again; the real close removes it); owned-window moves (root-relative, overlaid on older SURFACES until acknowledged); the hit-test cache (one query per surface, newest point queued, stale serials ignored, radius/near answers, expiry, resize forgets, retries, far points HTNOWHERE); protocol violations. Guest helper (`remote_windows_helper.c`) against a window model: in-place root resize, kept on the private display, application minimum acknowledged, host minimization leaves the source untouched, BUSY when not responding, owned windows moved (size kept when not resizable), menus not geometry targets, stale/foreign IDs refused, Close as SC_CLOSE and BUSY while modal-disabled, hit tests in visible-frame coordinates, WINDOW_STATE only on change with paced limit queries, icons on change, application min/max normalized and reported with a new serial, owned windows not normalized, no proxy messages towards an older host. Six deliberate mutations of these rules (close cancellation, modal refusal, coalescing, stale acks, host minimization, normalization) were each caught. |
+| Native (`remote_windows_proxy_native_test.c`) | The real guest side (helper session, parking, window control, capture engine) in this process against `remote-windows-proxy-test-app.exe` (its own process), over loopback TCP to the real host manager (`src/backend_win/remote_windows_proxy.cpp`), which creates real proxies on this desktop. The fake private display is the right half of the primary work area. Two roots shared at once (standard frame; custom chrome without a system caption); shell entries (unowned, `WS_EX_APPWINDOW`, guest title and icon, per-application AUMID, sources owned by the helper); no host caption or border strip (client top = visible top, client = guest visible frame, the DWM border is drawn transparent; guest marker/title band at the client origin); guest hit testing through the proxy (custom caption, minimize/maximize/close boxes, top edge; standard caption and the application's own maximize button for Snap Layouts; host side border = native resize); acknowledged resize (900x600 reaches the source and the frames), the application minimum adopted and mirrored in WM_GETMINMAXINFO; host maximize fills the work area with the source sized but never maximized, restore, host minimize leaves the source untouched; application maximize/minimize replayed on the proxy; an overflowing menu as an owned non-activating popup outside the root; a modal dialog as an owned framed proxy with the root disabled, host Close refused, the dialog moved by +40,+30 through the host; Close with unsaved changes shows the prompt, cancellation keeps window and proxy; unselect restores exactly without closing; a real Close removes the proxy; stopping the manager (app exit) restores the source; no proxy windows left. `-Snap`: Win+Left snaps a proxy to the left half and the guest follows the snapped size. Runs with shared GPU pools and again with forced CPU frames. |
+
+Guest check (Windows 11 guest with the eh6.6 helper, branch host so the VM has services 9-11):
+`bin\tests\remote-windows-proxy\remote-windows-proxy-vm-check.exe --vm <runtime-id> --select <title part> [--select ...] [--seconds N] [--cpu] [--log <file>] [--evidence <dir>]`
+uses the real manager over AF_HYPERV, prints the guest inventory, shares the matching windows
+and keeps the proxies for interactive qualification (move, resize, Snap, minimize/maximize, menus,
+dialogs, Close with unsaved changes). It checks shell entry, frames, no host caption and client =
+guest frame per proxy; Ctrl+C or the timeout ends sharing (the guest restores its windows).
+Exit 2 means the guest helper is older (upgrade required) or not reachable.
+
+Proxy rules (see `asb_remote_windows.h`, "Proxy windows", and `remote_windows_proxy.h`): one
+guest pixel per host pixel; the proxy client area is the guest window's visible frame, so the
+application's own title bar is the only one; Close goes to the application (SC_CLOSE) and the
+proxy stays until the window really closes; a modal owned window disables the root proxy;
+host minimization never minimizes the source.
+
+# Remote Windows host and guest tray selectors (eh6.8)
+
+```powershell
+.\tools\tests\test-remote-windows-selector.ps1            # model suite + native UI suite
+.\tools\tests\test-remote-windows-selector.ps1 -SkipNative
+.\tools\tests\test-remote-windows-selector.ps1 -Evidence C:\path\to\evidence   # flyout screenshots (BMP)
+```
+
+| Suite | Covers |
+| --- | --- |
+| Model (`remote_windows_selector_test.c`) | Flyout placement on bottom/top/left/right taskbars, the overflow area, clamping at screen edges, negative-coordinate monitors and oversized flyouts; tray click sequences (a single click deferred by the double-click time, double click only shows App Sandbox, right click cancels a pending click, the click that dismissed the flyout does nothing); row and status texts for every state (requesting, sharing, shared, restoring, failed with reason, stale windows silent; connecting, not connected, upgrade, no guest, several guests, empty); duplicate titles distinguished by application. Host session: a guest SELECT_REQUEST runs through the host's own selection path (SELECT_REQUEST back to the guest, proxy on SHARED, unselect restores), refusals answered with ERROR carrying the guest's request ID (stale ID, upgrade required), a guest without the capability is a protocol violation, inventory icons only for listed IDs. Guest helper: a toggle sends SELECT_REQUEST and the row is pending, one request per row, a host ERROR shows the reason, the host acting on the window clears it, share states map to shared/sharing/restoring, unanswered requests fail after 5 s, inventory icons sent once and again only when they change, Restore all reaches the host, a host without the selector shows the upgrade state and refuses toggles locally. |
+| Native (`remote_windows_selector_native_test.c`) | Real flyout windows (dark and light): rows, toggles, statuses and placement above the taskbar; Space/Enter only request (pending row, a second toggle refused) until the model acknowledges; a rejected request shows its reason; Home/End/Down navigation; a new window and a new title keep the focus on the same window; MSAA exposes each row as a named check button with its checked state; Esc and deactivation close (deactivation is reported so the dismissing tray click is ignored); upgrade state disables the rows; empty and several-guests states. At 150 % DPI: rows and width scale, 8 rows visible and the rest scrolls, top-taskbar placement and side anchors on the anchor's monitor. The tray icon is re-added on `TaskbarCreated` (Explorer restart). The guest tray thread: published models drive its flyout, a toggle becomes a selection action for the control thread, `TaskbarCreated` re-adds the guest icon. |
+
+Host: tray left click opens the selector for the sole running Windows guest (right-click menu and
+double-click Show App Sandbox unchanged). Guest: the helper's tray icon opens the same flyout;
+right click offers Restore all windows and Exit (everything is restored first; the service does
+not start the helper again in that session).
+
+# Remote Windows two-way copy-only OLE file drag and drop (eh6.9)
+
+```powershell
+.\tools\tests\test-remote-windows-files.ps1               # model suite + native suite
+.\tools\tests\test-remote-windows-files.ps1 -SkipNative
+.\tools\tests\test-remote-windows-files.ps1 -Verbose      # native suite with bridge/broker logs
+.\tools\tests\test-remote-windows-protocol.ps1            # includes the drag/file codecs
+.\tools\tests\test-remote-windows-proxy.ps1 -SkipNative   # includes the session/helper drag arbitration
+node tools\tests\remote_windows_registration_test.cjs
+```
+
+| Suite | Covers |
+| --- | --- |
+| Codecs (`remote_windows_protocol_test.c`) | DRAG_PROBE / DRAG_STATE / DRAG_ACK on the control channel only; FILES_HELLO / FILE_POINTER / FILE_FEEDBACK / FILE_STREAM on the file channel; field validation (probe needs a surface and serial, ACTIVE needs a session, state/ack values per type, effects only NONE or COPY, chunk limits, pointer bounds, top-level and entry limits found before allocation, host -> guest BEGIN needs a target); hostile entry names patched onto the wire (traversal, roots, drives, streams, devices, trailing dots/spaces, empty segments, `\\?\`) never decode. |
+| Model (`remote_windows_files_test.c`) | The receive rules of `asb_rw_files.c`: a valid nested Unicode stream; index gaps, wrong session, entries before BEGIN, STREAM too early / too small / too large; hostile names; top-level single segments; orphans, entries under files, late top-level items; duplicates and case aliases (ASCII and accented); directory sizes; data before STREAM, for directories, past the size, at a wrong offset, interleaved, restarted, empty, unknown index; a nested file's data must follow its entry; END with missing entries/bytes, wrong totals or an error status; 20 000 entries. |
+| Session (`remote_windows_proxy_test.c`, "drag") | Host pointer arbitration: probe only for a button this source pressed in the active proxy; while probing nothing is injected (moves, Escape); stale probe answers refused; FROM_GUEST releases the proxy's capture and forgets the held button (no button-up injected even when host focus moves to the broker or the session ends); NONE resumes normal forwarding; SINK answers the host button-up with DRAG_ACK RELEASE; unanswered probes time out; TO_GUEST claims a fresh input epoch before DRAG_ACK ALLOW, a second drag is refused, a viewer takeover cancels once, automation ownership refuses; capability gating on both sides; the guest helper routes DRAG_PROBE / DRAG_ACK only when files were negotiated and publishes the surface table. |
+| Native (`remote_windows_files_native_test.cpp`) | Real trees (nested Unicode folders, empty files/folders, hidden files, 9-64 MB files). Sources: order and totals; junctions inside and at the top, symbolic links, offline items, missing paths, devices, `GLOBALROOT`, drive roots, empty and duplicate names rejected; a file truncated or replaced after the walk fails the stream. Staging: byte-for-byte equality, delivered staging kept, truncated and hostile streams removed. Bridge: the guest bridge and the host broker in one process over loopback TCP with real shell data objects, real OLE drop targets/sources and real `IFileOperation` copies (only the two `DoDragDrop` loops and the guest pointer are simulated, because a real drag would follow this desktop's mouse). Host -> guest: feedback only after the guest target reports, the guest pointer mapped to the surface and released at the drop point, a 64 MB + tree copy, a second drop renamed by the destination's own conflict handling, a refusing target, leave, Escape in the guest loop, unsupported data, a junction found by the background walk, a source deleted after the drag began. Guest -> host: probe, offer, deferred drop until staged, Escape in the host loop, unsupported data parked until RELEASE, no drag. Disconnect mid-transfer: nothing delivered, the pointer released, incomplete staging removed. Sources intact, the clipboard sequence number unchanged. |
+
+Native qualification (real host and guest; needs the eh6.9 host install, `AppSandboxDrag.exe` beside
+`AppSandbox.exe`, and the 1.4.0 helper in the guest): drag files and a nested Unicode folder from host
+Explorer onto a shared guest Explorer window (and the reverse, out of a shared window onto the host
+desktop or an Explorer folder). Expect the copy cursor only where the guest target accepts, the
+destination's own conflict prompt, progress/Cancel in the host broker window for large copies, the
+sources untouched, and nothing on the clipboard. The broker logs to
+`%LOCALAPPDATA%\AppSandbox\RemoteWindows\drag-broker.log`; the helper to its `helper.log`.

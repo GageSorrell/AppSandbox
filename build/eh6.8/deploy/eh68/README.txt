@@ -1,0 +1,1 @@
+eh6.8 guest update (x64): appsandbox-remote-windows.exe (helper 1.3.0: guest tray selector, guest selection requests, inventory icons) and appsandbox-agent.exe (does not restart a helper the user exited from its tray). Run install.ps1 elevated; originals kept as *.eh67-original.

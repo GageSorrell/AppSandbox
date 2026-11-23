@@ -156,6 +156,7 @@ xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="appsandbox-displays.c" />
+    <ClInclude Include="..\transport\asb_private_display.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

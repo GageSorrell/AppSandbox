@@ -156,6 +156,9 @@ xcopy /Y "$(TargetPath)" "$(SolutionDir)release\resources\"</Command>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="agent.c" />
+    <ClCompile Include="remote_windows_display.c" />
+    <ClInclude Include="remote_windows_display.h" />
+    <ClInclude Include="..\transport\asb_private_display.h" />
     <ClCompile Include="gl_vk_provision.c" />
     <ClCompile Include="p9copy.c" />
     <ClCompile Include="..\transport\asb_transport.c" />

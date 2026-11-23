@@ -1,0 +1,1 @@
+eh6.9 guest update (x64): appsandbox-remote-windows.exe (helper 1.4.0: two-way copy-only OLE file and folder drag and drop over channel 11; staging in %LOCALAPPDATA%\AppSandbox\RemoteWindows\Drag). Run install.ps1 elevated; the original is kept as *.eh68-original. The host needs the eh6.9 AppSandbox.exe, appsandbox_core.dll and AppSandboxDrag.exe (beside AppSandbox.exe).

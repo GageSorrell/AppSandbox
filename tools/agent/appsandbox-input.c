@@ -87,6 +87,28 @@ static void inject_input(const InputPacket *pkt, UINT mouse_version)
                 pkt->param2 > INPUT_MOUSE_ABSOLUTE_MAX) return;
             inp.mi.dx = (LONG)pkt->param1;
             inp.mi.dy = (LONG)pkt->param2;
+        } else if (pkt->param3 == INPUT_MOUSE_VIRTUAL &&
+                   mouse_version >= INPUT_MOUSE_VIRTUAL_VERSION) {
+            /* Remote Windows (eh6.7): guest virtual-screen physical pixels, any monitor
+               (the private display included). */
+            int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            UINT32 nx = 0, ny = 0;
+            POINT now;
+            asb_input_virtual_normalize((INT32)pkt->param1, (INT32)pkt->param2, vx, vy, vw, vh, &nx, &ny);
+            inp.mi.dx = (LONG)nx;
+            inp.mi.dy = (LONG)ny;
+            inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+            if (SendInput(1, &inp, sizeof(INPUT)) == 0) {
+                input_log("SendInput(MOUSE_MOVE virtual) failed: %lu", GetLastError());
+                break;
+            }
+            /* Normalized coordinates can land one pixel off; the target is exact. */
+            if (GetPhysicalCursorPos(&now) && (now.x != (INT32)pkt->param1 || now.y != (INT32)pkt->param2) &&
+                (INT32)pkt->param1 >= vx && (INT32)pkt->param1 < vx + vw &&
+                (INT32)pkt->param2 >= vy && (INT32)pkt->param2 < vy + vh)
+                SetPhysicalCursorPos((INT32)pkt->param1, (INT32)pkt->param2);
+            break;
         } else if (pkt->param3 == 0) {
             int screen_w = GetSystemMetrics(SM_CXSCREEN);
             int screen_h = GetSystemMetrics(SM_CYSCREEN);
@@ -321,7 +343,9 @@ static void handle_conn(AsbConn *c)
         if (pkt.type == INPUT_MOUSE_QUERY) {
             InputPacket reply = {INPUT_MAGIC, INPUT_MOUSE_REPLY, 0, pkt.param2, 0};
             if (pkt.param3 != 0) continue;
-            if (pkt.param1 >= INPUT_MOUSE_NORMALIZED_VERSION)
+            if (pkt.param1 >= INPUT_MOUSE_VIRTUAL_VERSION)
+                reply.param1 = INPUT_MOUSE_VIRTUAL_VERSION;
+            else if (pkt.param1 >= INPUT_MOUSE_NORMALIZED_VERSION)
                 reply.param1 = INPUT_MOUSE_NORMALIZED_VERSION;
             else if (pkt.param1 >= INPUT_MOUSE_VERSION)
                 reply.param1 = INPUT_MOUSE_VERSION;
